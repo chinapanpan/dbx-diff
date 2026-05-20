@@ -22,7 +22,7 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import col, count, lit
 
 
-DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "https://dbc-51ad87e6-c26d.cloud.databricks.com")
+DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "")
 DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 MAX_WORKERS = 15
 TIMEOUT_PER_TABLE = 600  # 10 minutes max per table comparison
@@ -41,6 +41,7 @@ def map_to_emr_table(dbx_table_name: str, emr_catalog: str) -> str:
 
 
 def get_spark(emr_catalog: str = "iceberg_catalog", warehouse: str = "s3://zpf-databricks-event/emr/demo2") -> SparkSession:
+    """Get or create SparkSession. Configs here are defaults; spark-submit --conf overrides them."""
     return SparkSession.builder \
         .appName("DbxDiff") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
@@ -97,18 +98,35 @@ def read_emr_table(spark: SparkSession, table_name: str) -> DataFrame:
 
 
 def parse_csv(csv_path: str) -> List[Dict[str, str]]:
-    """Parse input CSV file (comma-delimited)."""
+    """Parse input CSV file (comma-delimited). Supports local or S3 paths.
+
+    CSV columns: table_name, primary_keys, pt_start, pt_end, pt_keys, dbx_location (optional)
+    If dbx_location is provided, it will be used directly instead of calling Databricks API.
+    """
+    if csv_path.startswith("s3://"):
+        import boto3
+        s3 = boto3.client("s3")
+        bucket, key = csv_path.replace("s3://", "").split("/", 1)
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        content = obj["Body"].read().decode("utf-8")
+        import io
+        f = io.StringIO(content)
+    else:
+        f = open(csv_path, 'r')
+
     rows = []
-    with open(csv_path, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append({
-                'table_name': row['table_name'].strip(),
-                'primary_keys': row.get('primary_keys', '').strip(),
-                'pt_start': row.get('pt_start', '').strip(),
-                'pt_end': row.get('pt_end', '').strip(),
-                'pt_keys': row.get('pt_keys', '').strip(),
-            })
+    reader = csv.DictReader(f)
+    for row in reader:
+        rows.append({
+            'table_name': row['table_name'].strip(),
+            'primary_keys': row.get('primary_keys', '').strip(),
+            'pt_start': row.get('pt_start', '').strip(),
+            'pt_end': row.get('pt_end', '').strip(),
+            'pt_keys': row.get('pt_keys', '').strip(),
+            'dbx_location': row.get('dbx_location', '').strip(),
+        })
+    if not csv_path.startswith("s3://"):
+        f.close()
     return rows
 
 
@@ -318,8 +336,10 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str, em
     append_md(report_path, md_content)
 
     try:
-        # Get Databricks table location
-        dbx_location = get_table_location(table_name)
+        # Get Databricks table location (from config or API)
+        dbx_location = config.get('dbx_location', '')
+        if not dbx_location:
+            dbx_location = get_table_location(table_name)
 
         # Read Databricks Delta table
         df_dbx_full = read_delta_table(spark, dbx_location)
@@ -408,13 +428,24 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str, em
 
 def main():
     parser = argparse.ArgumentParser(description="Databricks vs EMR Data Diff Tool")
-    parser.add_argument("--csv", required=True, help="Path to input CSV file (space-delimited)")
+    parser.add_argument("--csv", required=True, help="Path to input CSV file (comma-delimited)")
     parser.add_argument("--s3-output", required=True, help="S3 path for output report (e.g. s3://bucket/path/report.md)")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"Number of parallel workers (default: {MAX_WORKERS})")
     parser.add_argument("--timeout", type=int, default=TIMEOUT_PER_TABLE, help=f"Timeout per table in seconds (default: {TIMEOUT_PER_TABLE})")
     parser.add_argument("--emr-catalog", default=EMR_CATALOG, help=f"EMR catalog name (default: {EMR_CATALOG})")
     parser.add_argument("--emr-warehouse", default="s3://zpf-databricks-event/emr/demo2", help="EMR Iceberg warehouse location")
+    parser.add_argument("--databricks-host", default=None, help="Databricks workspace URL (overrides DATABRICKS_HOST env)")
+    parser.add_argument("--databricks-token", default=None, help="Databricks access token (overrides DATABRICKS_TOKEN env)")
     args = parser.parse_args()
+
+    global DATABRICKS_HOST, DATABRICKS_TOKEN
+    if args.databricks_host:
+        DATABRICKS_HOST = args.databricks_host
+    if args.databricks_token:
+        DATABRICKS_TOKEN = args.databricks_token
+    if not DATABRICKS_HOST or not DATABRICKS_TOKEN:
+        print("ERROR: Databricks host and token must be provided via --databricks-host/--databricks-token or env vars DATABRICKS_HOST/DATABRICKS_TOKEN", file=sys.stderr)
+        sys.exit(1)
 
     spark = get_spark(emr_catalog=args.emr_catalog, warehouse=args.emr_warehouse)
 
