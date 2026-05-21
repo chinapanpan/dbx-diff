@@ -32,7 +32,7 @@ import boto3
 EMR_SERVERLESS_APP_ID = "00g5qqg0spv6bq0l"
 EXECUTION_ROLE_ARN = "arn:aws:iam::415797100173:role/EMRServerlessExecutionRole"
 S3_CODE_BUCKET = "s3://zpf-databricks-event/code"
-S3_PYLIBS = "s3://zpf-databricks-event/code/pylibs.zip"
+S3_VENV_ARCHIVE = "s3://zpf-databricks-event/code/pyspark_py312_venv.tar.gz"
 
 
 def upload_script_to_s3():
@@ -151,13 +151,18 @@ def submit_serverless(args):
         "--conf", "spark.executor.cores=4",
         "--conf", "spark.dynamicAllocation.enabled=true",
         "--conf", "spark.dynamicAllocation.maxExecutors=50",
-        "--conf", f"spark.submit.pyFiles={S3_PYLIBS}",
+        "--conf", f"spark.archives={args.venv_archive}#environment",
+        "--conf", "spark.emr-serverless.driverEnv.PYSPARK_DRIVER_PYTHON=./environment/bin/python3.12",
+        "--conf", "spark.emr-serverless.driverEnv.PYSPARK_PYTHON=./environment/bin/python3.12",
+        "--conf", "spark.executorEnv.PYSPARK_PYTHON=./environment/bin/python3.12",
+        "--conf", "spark.emr-serverless.driverEnv.LD_LIBRARY_PATH=./environment/lib",
+        "--conf", "spark.executorEnv.LD_LIBRARY_PATH=./environment/lib",
+        "--conf", "spark.emr-serverless.driverEnv.PYTHONHOME=./environment",
+        "--conf", "spark.executorEnv.PYTHONHOME=./environment",
         "--conf", "spark.emr-serverless.driverEnv.DATABRICKS_HOST=" + args.databricks_host,
     ]
 
-    # Pass credentials via env vars or secret ARN
     if args.databricks_secret_arn:
-        # OAuth2 mode: pass secret ARN as job argument, no token in env
         pass
     elif args.databricks_token:
         spark_submit_params.extend([
@@ -269,6 +274,7 @@ def main():
     parser.add_argument("--emr-warehouse", default="s3://zpf-databricks-event/emr/demo2", help="EMR Iceberg warehouse S3 path")
     parser.add_argument("--application-id", default=EMR_SERVERLESS_APP_ID, help="EMR Serverless application ID")
     parser.add_argument("--execution-role-arn", default=EXECUTION_ROLE_ARN, help="EMR Serverless execution role ARN")
+    parser.add_argument("--venv-archive", default=S3_VENV_ARCHIVE, help="S3 path to Python 3.12 venv tar.gz for EMR Serverless")
     args = parser.parse_args()
 
     if args.mode == "serverless":
