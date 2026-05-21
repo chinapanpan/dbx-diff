@@ -103,6 +103,24 @@ def resolve_and_upload_csv(args) -> str:
     return s3_csv_path
 
 
+def _build_job_args(args, s3_csv_path: str) -> list:
+    """Build entryPointArguments for the Spark job."""
+    job_args = [
+        "--csv", s3_csv_path,
+        "--s3-output", args.s3_output,
+        "--workers", str(args.workers),
+        "--timeout", str(args.timeout),
+        "--emr-catalog", args.emr_catalog,
+        "--emr-warehouse", args.emr_warehouse,
+        "--databricks-host", args.databricks_host,
+    ]
+    if args.databricks_secret_arn:
+        job_args.extend(["--databricks-secret-arn", args.databricks_secret_arn])
+    elif args.databricks_token:
+        job_args.extend(["--databricks-token", args.databricks_token])
+    return job_args
+
+
 def submit_serverless(args):
     """Submit job to EMR Serverless.
 
@@ -135,10 +153,17 @@ def submit_serverless(args):
         "--conf", "spark.dynamicAllocation.maxExecutors=50",
         "--conf", f"spark.submit.pyFiles={S3_PYLIBS}",
         "--conf", "spark.emr-serverless.driverEnv.DATABRICKS_HOST=" + args.databricks_host,
-        "--conf", "spark.emr-serverless.driverEnv.DATABRICKS_TOKEN=" + args.databricks_token,
-        "--conf", "spark.executorEnv.DATABRICKS_HOST=" + args.databricks_host,
-        "--conf", "spark.executorEnv.DATABRICKS_TOKEN=" + args.databricks_token,
     ]
+
+    # Pass credentials via env vars or secret ARN
+    if args.databricks_secret_arn:
+        # OAuth2 mode: pass secret ARN as job argument, no token in env
+        pass
+    elif args.databricks_token:
+        spark_submit_params.extend([
+            "--conf", "spark.emr-serverless.driverEnv.DATABRICKS_TOKEN=" + args.databricks_token,
+            "--conf", "spark.executorEnv.DATABRICKS_TOKEN=" + args.databricks_token,
+        ])
 
     client = boto3.client("emr-serverless", region_name="us-west-2")
 
@@ -148,14 +173,7 @@ def submit_serverless(args):
         jobDriver={
             "sparkSubmit": {
                 "entryPoint": s3_script,
-                "entryPointArguments": [
-                    "--csv", s3_csv_path,
-                    "--s3-output", args.s3_output,
-                    "--workers", str(args.workers),
-                    "--timeout", str(args.timeout),
-                    "--emr-catalog", args.emr_catalog,
-                    "--emr-warehouse", args.emr_warehouse,
-                ],
+                "entryPointArguments": _build_job_args(args, s3_csv_path),
                 "sparkSubmitParameters": " ".join(spark_submit_params),
             }
         },
@@ -222,12 +240,14 @@ def submit_yarn(args):
         "--emr-catalog", args.emr_catalog,
         "--emr-warehouse", args.emr_warehouse,
         "--databricks-host", args.databricks_host,
-        "--databricks-token", args.databricks_token,
     ]
+    if args.databricks_secret_arn:
+        cmd.extend(["--databricks-secret-arn", args.databricks_secret_arn])
+    elif args.databricks_token:
+        cmd.extend(["--databricks-token", args.databricks_token])
 
     env = os.environ.copy()
     env["DATABRICKS_HOST"] = args.databricks_host
-    env["DATABRICKS_TOKEN"] = args.databricks_token
 
     print(f"Submitting spark job on YARN...")
     result = subprocess.run(cmd, env=env, capture_output=False, text=True)
@@ -240,7 +260,9 @@ def main():
     parser.add_argument("--csv", required=True, help="Path to input CSV file (S3 path for serverless, local for yarn)")
     parser.add_argument("--s3-output", required=True, help="S3 output path for report")
     parser.add_argument("--databricks-host", required=True, help="Databricks workspace URL")
-    parser.add_argument("--databricks-token", required=True, help="Databricks access token")
+    parser.add_argument("--databricks-token", default=None, help="Databricks access token")
+    parser.add_argument("--databricks-secret-arn", default=None,
+                        help="AWS Secrets Manager ARN for OAuth2 credentials (overrides --databricks-token)")
     parser.add_argument("--workers", type=int, default=15, help="Parallel workers (default: 15)")
     parser.add_argument("--timeout", type=int, default=600, help="Timeout per table in seconds (default: 600)")
     parser.add_argument("--emr-catalog", default="iceberg_catalog", help="EMR Iceberg catalog name")

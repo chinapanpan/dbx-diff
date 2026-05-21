@@ -7,6 +7,20 @@ and EMR (Spark SQL), outputs diff report as Markdown to S3.
 
 import sys
 import os
+
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except ImportError:
+    if not os.environ.get("SSL_CERT_FILE"):
+        for ca_path in [
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/certs/ca-certificates.crt",
+        ]:
+            if os.path.exists(ca_path):
+                os.environ["SSL_CERT_FILE"] = ca_path
+                break
+
 import time
 import datetime
 import csv
@@ -29,6 +43,9 @@ TIMEOUT_PER_TABLE = 600  # 10 minutes max per table comparison
 EMR_CATALOG = "iceberg_catalog"  # default, overridable via --emr-catalog
 
 _write_lock = threading.Lock()
+_token_lock = threading.Lock()
+_oauth2_token = None
+_oauth2_expiry = 0
 
 
 def map_to_emr_table(dbx_table_name: str, emr_catalog: str) -> str:
@@ -53,38 +70,81 @@ def get_spark(emr_catalog: str = "iceberg_catalog", warehouse: str = "s3://zpf-d
         .getOrCreate()
 
 
-def get_table_location(table_name: str) -> str:
-    """Get S3 storage location of a Databricks Unity Catalog table via REST API."""
+def get_secret_from_sm(secret_arn: str, region: str = "us-west-2") -> Tuple[str, str]:
+    """Retrieve client_id:client_secret from AWS Secrets Manager (plaintext, colon-separated)."""
+    import boto3
+    client = boto3.client("secretsmanager", region_name=region)
+    resp = client.get_secret_value(SecretId=secret_arn)
+    secret_str = resp["SecretString"].strip()
+    parts = secret_str.split(":", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(f"Secret {secret_arn} must be plaintext format: client_id:client_secret")
+    print(f"Retrieved OAuth2 credentials from Secrets Manager: {secret_arn}")
+    return parts[0], parts[1]
+
+
+def get_oauth2_token(host: str, client_id: str, client_secret: str) -> str:
+    """Get OAuth2 access token from Databricks using client credentials flow."""
+    global _oauth2_token, _oauth2_expiry
+    with _token_lock:
+        if _oauth2_token and time.time() < _oauth2_expiry - 60:
+            return _oauth2_token
+        url = f"{host}/oidc/v1/token"
+        data = {
+            "grant_type": "client_credentials",
+            "scope": "all-apis",
+        }
+        resp = requests.post(url, data=data, auth=(client_id, client_secret), timeout=30)
+        if resp.status_code != 200:
+            raise Exception(f"OAuth2 token request failed: {resp.status_code} {resp.text}")
+        token_data = resp.json()
+        _oauth2_token = token_data["access_token"]
+        _oauth2_expiry = time.time() + token_data.get("expires_in", 3600)
+        print(f"Obtained OAuth2 token, expires in {token_data.get('expires_in', 3600)}s")
+        return _oauth2_token
+
+
+def get_dbx_auth_headers() -> Dict[str, str]:
+    """Get authorization headers for Databricks API calls."""
+    return {"Authorization": f"Bearer {DATABRICKS_TOKEN}"}
+
+
+def fetch_table_metadata(table_name: str) -> Dict:
+    """Fetch table metadata (location + partition columns) from Databricks Unity Catalog API."""
     url = f"{DATABRICKS_HOST}/api/2.1/unity-catalog/tables/{table_name}"
-    headers = {"Authorization": f"Bearer {DATABRICKS_TOKEN}"}
+    headers = get_dbx_auth_headers()
     resp = requests.get(url, headers=headers, timeout=30)
     if resp.status_code != 200:
         raise Exception(f"Failed to get table info for {table_name}: {resp.status_code} {resp.text}")
     info = resp.json()
-    location = info.get("storage_location")
-    if not location:
-        raise Exception(f"No storage_location found for table {table_name}")
-    return location
-
-
-def get_table_columns_dbx(table_name: str) -> Tuple[List[str], List[str]]:
-    """Get column names and partition columns from Databricks Unity Catalog API."""
-    url = f"{DATABRICKS_HOST}/api/2.1/unity-catalog/tables/{table_name}"
-    headers = {"Authorization": f"Bearer {DATABRICKS_TOKEN}"}
-    resp = requests.get(url, headers=headers, timeout=30)
-    if resp.status_code != 200:
-        raise Exception(f"Failed to get table info for {table_name}: {resp.status_code} {resp.text}")
-    info = resp.json()
+    location = info.get("storage_location", "")
     columns = info.get("columns", [])
-    data_cols = []
     part_cols = []
     for c in columns:
-        name = c.get("name", "")
         if c.get("partition_index") is not None:
-            part_cols.append(name)
-        else:
-            data_cols.append(name)
-    return data_cols, part_cols
+            part_cols.append(c.get("name", ""))
+    return {"location": location, "partition_cols": part_cols}
+
+
+def prefetch_all_table_metadata(configs: List[Dict]) -> Dict[str, Dict]:
+    """Batch-fetch metadata for all tables upfront. Returns dict keyed by table_name."""
+    metadata = {}
+    print(f"Pre-fetching metadata for {len(configs)} tables from Databricks API...")
+    for i, config in enumerate(configs):
+        table_name = config['table_name']
+        if config.get('dbx_location'):
+            metadata[table_name] = {"location": config['dbx_location'], "partition_cols": []}
+            continue
+        try:
+            meta = fetch_table_metadata(table_name)
+            metadata[table_name] = meta
+        except Exception as e:
+            print(f"  WARNING: Failed to fetch metadata for {table_name}: {e}", file=sys.stderr)
+            metadata[table_name] = {"location": "", "partition_cols": [], "error": str(e)}
+        if (i + 1) % 50 == 0:
+            print(f"  Fetched {i + 1}/{len(configs)} tables")
+    print(f"Pre-fetch complete. {sum(1 for v in metadata.values() if v.get('location'))} tables resolved.")
+    return metadata
 
 
 def read_delta_table(spark: SparkSession, s3_location: str) -> DataFrame:
@@ -314,8 +374,14 @@ def format_partition_count_md(table_name: str, dbx_partitions: List[str], emr_pa
     return md
 
 
-def compare_single_table(spark: SparkSession, config: Dict, report_path: str, emr_catalog: str):
-    """Compare a single table between Databricks and EMR."""
+def compare_single_table(spark: SparkSession, config: Dict, report_path: str, emr_catalog: str,
+                         table_metadata: Dict = None):
+    """Compare a single table between Databricks and EMR.
+
+    table_metadata: pre-fetched dict with 'location' and 'partition_cols' from Databricks API.
+    The 'partition_cols' list determines whether the table is treated as partitioned
+    (must contain 'pt'), regardless of what CSV says in pt_start/pt_end.
+    """
     table_name = config['table_name']
     emr_table_name = map_to_emr_table(table_name, emr_catalog)
     primary_keys = [k.strip() for k in config['primary_keys'].split(',') if k.strip()] if config['primary_keys'] else []
@@ -323,7 +389,11 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str, em
     pt_end = config['pt_end'] if config['pt_end'] else None
     pt_keys = [k.strip() for k in config['pt_keys'].split(',') if k.strip()] if config['pt_keys'] else []
 
-    is_partitioned = bool(pt_start and pt_end)
+    # Determine if table is actually partitioned by 'pt' based on API metadata
+    meta = table_metadata or {}
+    part_cols = meta.get("partition_cols", [])
+    has_pt_column = "pt" in part_cols
+    is_partitioned = has_pt_column and bool(pt_start and pt_end)
     has_primary_keys = bool(primary_keys)
 
     start_time = time.time()
@@ -332,14 +402,18 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str, em
     md_content += f"- Partitioned: {'Yes' if is_partitioned else 'No'}"
     if is_partitioned:
         md_content += f" (pt_start={pt_start}, pt_end={pt_end})"
+    elif pt_start and pt_end and not has_pt_column:
+        md_content += f" (CSV has pt_start/pt_end but table has no 'pt' partition column — treating as non-partitioned)"
     md_content += f"\n- Started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     append_md(report_path, md_content)
 
     try:
-        # Get Databricks table location (from config or API)
-        dbx_location = config.get('dbx_location', '')
+        # Get Databricks table location from pre-fetched metadata
+        dbx_location = meta.get("location", "")
         if not dbx_location:
-            dbx_location = get_table_location(table_name)
+            if meta.get("error"):
+                raise Exception(f"Pre-fetch failed: {meta['error']}")
+            raise Exception(f"No storage_location found for table {table_name}")
 
         # Read Databricks Delta table
         df_dbx_full = read_delta_table(spark, dbx_location)
@@ -349,7 +423,6 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str, em
 
         # Get column info
         dbx_cols = [c for c in df_dbx_full.columns]
-        emr_cols = [c for c in df_emr_full.columns]
 
         # Determine data columns (excluding partition column 'pt' if partitioned)
         if is_partitioned:
@@ -436,15 +509,29 @@ def main():
     parser.add_argument("--emr-warehouse", default="s3://zpf-databricks-event/emr/demo2", help="EMR Iceberg warehouse location")
     parser.add_argument("--databricks-host", default=None, help="Databricks workspace URL (overrides DATABRICKS_HOST env)")
     parser.add_argument("--databricks-token", default=None, help="Databricks access token (overrides DATABRICKS_TOKEN env)")
+    parser.add_argument("--databricks-secret-arn", default=None,
+                        help="AWS Secrets Manager ARN containing client_id:client_secret for OAuth2 (overrides --databricks-token)")
+    parser.add_argument("--region", default="us-west-2", help="AWS region for Secrets Manager (default: us-west-2)")
     args = parser.parse_args()
 
     global DATABRICKS_HOST, DATABRICKS_TOKEN
     if args.databricks_host:
         DATABRICKS_HOST = args.databricks_host
-    if args.databricks_token:
+
+    # Authentication: OAuth2 via secret ARN takes precedence over token
+    if args.databricks_secret_arn:
+        if not DATABRICKS_HOST:
+            print("ERROR: --databricks-host is required when using --databricks-secret-arn", file=sys.stderr)
+            sys.exit(1)
+        client_id, client_secret = get_secret_from_sm(args.databricks_secret_arn, args.region)
+        DATABRICKS_TOKEN = get_oauth2_token(DATABRICKS_HOST, client_id, client_secret)
+    elif args.databricks_token:
         DATABRICKS_TOKEN = args.databricks_token
+
     if not DATABRICKS_HOST or not DATABRICKS_TOKEN:
-        print("ERROR: Databricks host and token must be provided via --databricks-host/--databricks-token or env vars DATABRICKS_HOST/DATABRICKS_TOKEN", file=sys.stderr)
+        print("ERROR: Databricks host and credentials must be provided via "
+              "--databricks-secret-arn or --databricks-host/--databricks-token or env vars",
+              file=sys.stderr)
         sys.exit(1)
 
     spark = get_spark(emr_catalog=args.emr_catalog, warehouse=args.emr_warehouse)
@@ -453,12 +540,19 @@ def main():
     configs = parse_csv(args.csv)
     print(f"Loaded {len(configs)} table configs from {args.csv}")
 
+    # Batch pre-fetch all table metadata (location + partition columns) from Databricks API
+    prefetch_start = time.time()
+    all_metadata = prefetch_all_table_metadata(configs)
+    prefetch_elapsed = time.time() - prefetch_start
+    print(f"Metadata pre-fetch took {prefetch_elapsed:.1f}s")
+
     # Create local temp report file
     report_path = tempfile.mktemp(suffix=".md")
     header = f"# Databricks vs EMR Data Diff Report\n\n"
     header += f"- Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     header += f"- Tables: {len(configs)}\n"
-    header += f"- Workers: {args.workers}\n\n"
+    header += f"- Workers: {args.workers}\n"
+    header += f"- Metadata pre-fetch: {prefetch_elapsed:.1f}s\n\n"
     with open(report_path, 'w') as f:
         f.write(header)
 
@@ -467,7 +561,8 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {}
         for config in configs:
-            future = executor.submit(compare_single_table, spark, config, report_path, args.emr_catalog)
+            table_meta = all_metadata.get(config['table_name'], {})
+            future = executor.submit(compare_single_table, spark, config, report_path, args.emr_catalog, table_meta)
             futures[future] = config['table_name']
 
         for future in as_completed(futures):
@@ -484,7 +579,9 @@ def main():
     total_elapsed = time.time() - total_start
     summary = f"\n---\n## Summary\n\n"
     summary += f"- Total tables: {len(configs)}\n"
-    summary += f"- Total time: {total_elapsed:.1f}s\n"
+    summary += f"- Metadata pre-fetch: {prefetch_elapsed:.1f}s\n"
+    summary += f"- Comparison time: {total_elapsed:.1f}s\n"
+    summary += f"- Total time: {prefetch_elapsed + total_elapsed:.1f}s\n"
     append_md(report_path, summary)
 
     # Upload to S3
