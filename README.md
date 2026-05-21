@@ -52,7 +52,7 @@
 - Lake Formation 权限（EMR 角色需有 Glue Catalog 访问权限）
 - Python 3.12 venv 打包上传至 S3
 
-### 提交作业
+### 提交作业（OAuth2 认证，推荐）
 
 ```bash
 python3 submit_job.py \
@@ -60,8 +60,10 @@ python3 submit_job.py \
   --csv s3://your-bucket/code/tables.csv \
   --s3-output s3://your-bucket/reports/diff_report.md \
   --databricks-host https://your-workspace.cloud.databricks.com \
-  --databricks-token <token>
+  --databricks-secret-arn arn:aws:secretsmanager:us-west-2:<account>:secret:<name>
 ```
+
+`--databricks-secret-arn` 指向 AWS Secrets Manager 中存储的明文凭证，格式为 `client_id:client_secret`。程序通过 OAuth2 client_credentials 流获取 Databricks 访问令牌。
 
 `submit_job.py` 内部通过 `emr_common.Session` 完成以下流程：
 1. 自动将 `dbx_diff.py` 上传至 S3
@@ -136,8 +138,8 @@ submit_file(jobname, local_file, args)
 | `--csv` | （必填） | 输入 CSV 路径（S3 路径） |
 | `--s3-output` | （必填） | S3 输出报告路径 |
 | `--databricks-host` | （必填） | Databricks workspace URL |
-| `--databricks-token` | 无 | Databricks 访问令牌 |
-| `--databricks-secret-arn` | 无 | AWS Secrets Manager ARN（OAuth2 模式，优先于 token） |
+| `--databricks-secret-arn` | 无 | AWS Secrets Manager ARN（OAuth2 认证，推荐） |
+| `--databricks-token` | 无 | Databricks PAT（备选，secret-arn 优先） |
 | `--workers` | 15 | 并行 worker 数 |
 | `--timeout` | 600 | 单表超时时间（秒） |
 | `--emr-catalog` | `iceberg_catalog` | EMR Iceberg catalog 名称 |
@@ -201,10 +203,30 @@ Markdown 格式报告，实时追加写入，最终上传至 S3。示例：
 
 ## 认证方式
 
-支持两种 Databricks 认证方式（优先级从高到低）：
+推荐使用 **OAuth2 client_credentials** 认证 Databricks API：
 
-1. **OAuth2（推荐）**：通过 `--databricks-secret-arn` 指定 AWS Secrets Manager 中的 client_id/client_secret
-2. **Personal Access Token**：通过 `--databricks-token` 或环境变量 `DATABRICKS_TOKEN`
+1. 在 Databricks 中创建 Service Principal 并生成 OAuth2 client_id 和 client_secret
+2. 将凭证存入 AWS Secrets Manager，格式为明文 `client_id:client_secret`
+3. 通过 `--databricks-secret-arn` 传入 Secret ARN
+
+```bash
+# 认证流程
+--databricks-secret-arn arn:aws:secretsmanager:us-west-2:415797100173:secret:databricks-lnLMCq
+```
+
+程序内部调用：
+```python
+# 1. 从 Secrets Manager 获取凭证
+client_id, client_secret = get_secret_from_sm(secret_arn, region)
+
+# 2. 通过 OAuth2 client_credentials 获取 access_token
+token = get_oauth2_token(databricks_host, client_id, client_secret)
+
+# 3. 使用 token 调用 Databricks API（token 自动刷新）
+headers = {"Authorization": f"Bearer {token}"}
+```
+
+备选方式：通过 `--databricks-token` 传入 Personal Access Token（不推荐用于生产）
 
 ## EMR Serverless 部署
 
