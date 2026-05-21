@@ -68,7 +68,7 @@ def resolve_and_upload_csv(args) -> str:
         with open(args.csv, 'r') as f:
             content = f.read()
 
-    reader = csv_mod.DictReader(io.StringIO(content))
+    reader = csv_mod.DictReader(io.StringIO(content), delimiter=' ')
     rows = list(reader)
 
     # Resolve locations via Databricks API
@@ -86,10 +86,10 @@ def resolve_and_upload_csv(args) -> str:
             print(f"  WARNING: Could not resolve {table_name}: {resp.status_code}")
             row['dbx_location'] = ''
 
-    # Write enriched CSV
+    # Write enriched CSV (space-delimited)
     output = io.StringIO()
     fieldnames = ['table_name', 'primary_keys', 'pt_start', 'pt_end', 'pt_keys', 'dbx_location']
-    writer = csv_mod.DictWriter(output, fieldnames=fieldnames)
+    writer = csv_mod.DictWriter(output, fieldnames=fieldnames, delimiter=' ')
     writer.writeheader()
     for row in rows:
         writer.writerow({k: row.get(k, '') for k in fieldnames})

@@ -94,7 +94,7 @@ spark-submit \
 
 ## Input CSV Format
 
-Comma-delimited CSV with the following columns:
+Space-delimited CSV with the following columns (space is the delimiter because `primary_keys` itself uses commas internally):
 
 | Column | Required | Description |
 |--------|----------|-------------|
@@ -106,12 +106,12 @@ Comma-delimited CSV with the following columns:
 | `dbx_location` | No | Pre-resolved S3 path for Databricks table (auto-resolved if empty) |
 
 Example:
-```csv
-table_name,primary_keys,pt_start,pt_end,pt_keys
-workspace.demo2.test_pk_nopart,id,,,
-workspace.demo2.test_pk_part,"id,name",20250101,20250103,"20250101,20250102"
-workspace.demo2.test_nopk_nopart,,,,
-workspace.demo2.test_nopk_part,,20250101,20250103,"20250101,20250102"
+```
+table_name primary_keys pt_start pt_end pt_keys
+workspace.demo2.test_pk_nopart id
+workspace.demo2.test_pk_part id,name 20250101 20250103 20250101,20250102
+workspace.demo2.test_nopk_nopart
+workspace.demo2.test_nopk_part  20250101 20250103 20250101,20250102
 ```
 
 ## Comparison Rules

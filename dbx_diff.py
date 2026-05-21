@@ -98,7 +98,7 @@ def read_emr_table(spark: SparkSession, table_name: str) -> DataFrame:
 
 
 def parse_csv(csv_path: str) -> List[Dict[str, str]]:
-    """Parse input CSV file (comma-delimited). Supports local or S3 paths.
+    """Parse input CSV file (space-delimited). Supports local or S3 paths.
 
     CSV columns: table_name, primary_keys, pt_start, pt_end, pt_keys, dbx_location (optional)
     If dbx_location is provided, it will be used directly instead of calling Databricks API.
@@ -115,15 +115,15 @@ def parse_csv(csv_path: str) -> List[Dict[str, str]]:
         f = open(csv_path, 'r')
 
     rows = []
-    reader = csv.DictReader(f)
+    reader = csv.DictReader(f, delimiter=' ')
     for row in reader:
         rows.append({
-            'table_name': row['table_name'].strip(),
-            'primary_keys': row.get('primary_keys', '').strip(),
-            'pt_start': row.get('pt_start', '').strip(),
-            'pt_end': row.get('pt_end', '').strip(),
-            'pt_keys': row.get('pt_keys', '').strip(),
-            'dbx_location': row.get('dbx_location', '').strip(),
+            'table_name': (row.get('table_name') or '').strip(),
+            'primary_keys': (row.get('primary_keys') or '').strip(),
+            'pt_start': (row.get('pt_start') or '').strip(),
+            'pt_end': (row.get('pt_end') or '').strip(),
+            'pt_keys': (row.get('pt_keys') or '').strip(),
+            'dbx_location': (row.get('dbx_location') or '').strip(),
         })
     if not csv_path.startswith("s3://"):
         f.close()
@@ -428,7 +428,7 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str, em
 
 def main():
     parser = argparse.ArgumentParser(description="Databricks vs EMR Data Diff Tool")
-    parser.add_argument("--csv", required=True, help="Path to input CSV file (comma-delimited)")
+    parser.add_argument("--csv", required=True, help="Path to input CSV file (space-delimited)")
     parser.add_argument("--s3-output", required=True, help="S3 path for output report (e.g. s3://bucket/path/report.md)")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"Number of parallel workers (default: {MAX_WORKERS})")
     parser.add_argument("--timeout", type=int, default=TIMEOUT_PER_TABLE, help=f"Timeout per table in seconds (default: {TIMEOUT_PER_TABLE})")

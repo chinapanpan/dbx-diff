@@ -1,5 +1,5 @@
-table_name,primary_keys,pt_start,pt_end,pt_keys
-workspace.demo2.test_pk_nopart,id,,,
-workspace.demo2.test_pk_part,"id,name",20250101,20250103,"20250101,20250102"
-workspace.demo2.test_nopk_nopart,,,,
-workspace.demo2.test_nopk_part,,20250101,20250103,"20250101,20250102"
+table_name primary_keys pt_start pt_end pt_keys
+workspace.demo2.test_pk_nopart id
+workspace.demo2.test_pk_part id,name 20250101 20250103 20250101,20250102
+workspace.demo2.test_nopk_nopart
+workspace.demo2.test_nopk_part  20250101 20250103 20250101,20250102
