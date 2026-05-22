@@ -1,22 +1,16 @@
 """
-Set up test data in Databricks (workspace.demo2) and EMR (Spark/Glue catalog)
-to cover all 4 comparison scenarios.
+Set up test data in Databricks (workspace.demo2) and EMR (Iceberg catalog)
+for aggregate-based comparison testing (v3).
 
 Test tables:
-1. test_pk_nopart     — primary keys, non-partitioned (row-level diff)
-2. test_pk_part       — primary keys, partitioned (partition count + row-level)
-3. test_nopk_nopart   — no primary keys, non-partitioned (count only)
-4. test_nopk_part     — no primary keys, partitioned (partition count + per-pt count)
+1. test_nopk_nopart — non-partitioned, numeric columns (aggregate diff)
+2. test_nopk_part  — partitioned by pt, numeric columns (per-partition aggregate diff)
 """
 
 import sys
 import os
 import time
-import json
 import requests
-
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType
 
 
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "https://dbc-51ad87e6-c26d.cloud.databricks.com")
@@ -36,11 +30,10 @@ def dbx_sql(sql: str, wait: bool = True) -> dict:
     payload = {
         "statement": sql,
         "warehouse_id": None,
-        "wait_timeout": "60s" if wait else "0s",
+        "wait_timeout": "50s" if wait else "0s",
         "catalog": DBX_CATALOG,
         "schema": DBX_SCHEMA,
     }
-    # First get a warehouse
     wh_url = f"{DATABRICKS_HOST}/api/2.0/sql/warehouses"
     wh_resp = requests.get(wh_url, headers=headers, timeout=30)
     warehouses = wh_resp.json().get("warehouses", [])
@@ -56,7 +49,6 @@ def dbx_sql(sql: str, wait: bool = True) -> dict:
     status = result.get("status", {}).get("state", "")
     if status == "FAILED":
         raise Exception(f"SQL failed: {result.get('status', {}).get('error', {})}")
-    # Poll if pending
     stmt_id = result.get("statement_id")
     while status in ("PENDING", "RUNNING"):
         time.sleep(2)
@@ -73,169 +65,96 @@ def setup_databricks_tables():
     """Create and populate test tables in Databricks workspace.demo2."""
     print("Setting up Databricks tables...")
 
-    # 1. test_pk_nopart — with primary keys, no partition
-    dbx_sql("DROP TABLE IF EXISTS test_pk_nopart")
-    dbx_sql("""
-        CREATE TABLE test_pk_nopart (
-            id INT, name STRING, value INT
-        ) USING DELTA
-    """)
-    dbx_sql("""
-        INSERT INTO test_pk_nopart VALUES
-        (1, 'alice', 100),
-        (2, 'bob', 200),
-        (3, 'charlie', 300),
-        (4, 'david', 400),
-        (5, 'eve', 500)
-    """)
-    print("  Created test_pk_nopart")
-
-    # 2. test_pk_part — with primary keys, partitioned by pt
-    dbx_sql("DROP TABLE IF EXISTS test_pk_part")
-    dbx_sql("""
-        CREATE TABLE test_pk_part (
-            id INT, name STRING, amount INT, pt STRING
-        ) USING DELTA PARTITIONED BY (pt)
-    """)
-    dbx_sql("""
-        INSERT INTO test_pk_part VALUES
-        (1, 'alice', 10, '20250101'),
-        (2, 'bob', 20, '20250101'),
-        (3, 'charlie', 30, '20250102'),
-        (4, 'david', 40, '20250102'),
-        (5, 'eve', 50, '20250103')
-    """)
-    print("  Created test_pk_part")
-
-    # 3. test_nopk_nopart — no primary keys, no partition
+    # 1. test_nopk_nopart — non-partitioned with numeric columns
     dbx_sql("DROP TABLE IF EXISTS test_nopk_nopart")
     dbx_sql("""
         CREATE TABLE test_nopk_nopart (
-            event STRING, ts STRING, payload STRING
+            id INT, name STRING, value DOUBLE, score INT
         ) USING DELTA
     """)
     dbx_sql("""
         INSERT INTO test_nopk_nopart VALUES
-        ('click', '2025-01-01 00:00:00', '{"page":"home"}'),
-        ('view', '2025-01-01 00:01:00', '{"page":"about"}'),
-        ('click', '2025-01-01 00:02:00', '{"page":"shop"}')
+        (1, 'alice', 10.5, 80),
+        (2, 'bob', 20.3, 90),
+        (3, 'charlie', 30.7, 85),
+        (4, 'david', 40.1, 70),
+        (5, 'eve', 50.9, 95)
     """)
-    print("  Created test_nopk_nopart")
+    # Introduce difference: modify one row's value (will change max/avg)
+    dbx_sql("UPDATE test_nopk_nopart SET value = 99.9 WHERE id = 5")
+    # Add extra row (will change count)
+    dbx_sql("INSERT INTO test_nopk_nopart VALUES (6, 'frank', 60.0, 88)")
+    print("  Created test_nopk_nopart (6 rows, value[5] modified, extra row)")
 
-    # 4. test_nopk_part — no primary keys, partitioned
+    # 2. test_nopk_part — partitioned by pt with numeric columns
     dbx_sql("DROP TABLE IF EXISTS test_nopk_part")
     dbx_sql("""
         CREATE TABLE test_nopk_part (
-            event STRING, ts STRING, payload STRING, pt STRING
+            id INT, name STRING, amount DOUBLE, score INT, pt STRING
         ) USING DELTA PARTITIONED BY (pt)
     """)
     dbx_sql("""
         INSERT INTO test_nopk_part VALUES
-        ('click', '2025-01-01 00:00:00', '{"p":"a"}', '20250101'),
-        ('view', '2025-01-01 00:01:00', '{"p":"b"}', '20250101'),
-        ('click', '2025-01-02 00:00:00', '{"p":"c"}', '20250102'),
-        ('view', '2025-01-02 00:01:00', '{"p":"d"}', '20250102')
+        (1, 'alice', 100.0, 80, '20250101'),
+        (2, 'bob', 200.0, 90, '20250101'),
+        (3, 'charlie', 150.0, 85, '20250101'),
+        (4, 'david', 300.0, 70, '20250102'),
+        (5, 'eve', 250.0, 95, '20250102'),
+        (6, 'frank', 180.0, 88, '20250102')
     """)
-    print("  Created test_nopk_part")
-
-    # Now introduce some differences for testing
-    # Modify test_pk_nopart: change value for id=3 (will be detected as mismatch)
-    dbx_sql("UPDATE test_pk_nopart SET value = 999 WHERE id = 3")
-    # Add extra row in Databricks (only_in_dbx)
-    dbx_sql("INSERT INTO test_pk_nopart VALUES (6, 'frank', 600)")
-    print("  Introduced diffs in test_pk_nopart (id=3 value changed, id=6 added)")
-
-    # Modify test_pk_part: change amount for id=1 in pt=20250101
-    dbx_sql("UPDATE test_pk_part SET amount = 99 WHERE id = 1 AND pt = '20250101'")
-    print("  Introduced diff in test_pk_part (id=1, pt=20250101 amount changed)")
-
-    # Add extra row to test_nopk_nopart (count will differ)
-    dbx_sql("INSERT INTO test_nopk_nopart VALUES ('scroll', '2025-01-01 00:03:00', '{\"page\":\"faq\"}')")
-    print("  Introduced diff in test_nopk_nopart (extra row added)")
-
-    # Add extra partition to test_nopk_part
-    dbx_sql("INSERT INTO test_nopk_part VALUES ('click', '2025-01-03 00:00:00', '{\"p\":\"e\"}', '20250103')")
-    print("  Introduced diff in test_nopk_part (extra partition 20250103)")
+    # Introduce difference in pt=20250101: change amount for one row
+    dbx_sql("UPDATE test_nopk_part SET amount = 999.0 WHERE id = 1 AND pt = '20250101'")
+    # Add extra row in pt=20250102 (will change count for that partition)
+    dbx_sql("INSERT INTO test_nopk_part VALUES (7, 'grace', 400.0, 92, '20250102')")
+    print("  Created test_nopk_part (pt=20250101: amount[1] modified; pt=20250102: extra row)")
 
     print("Databricks setup complete!")
 
 
-def setup_emr_tables(spark: SparkSession):
-    """Create and populate test tables in EMR via Spark SQL (Iceberg catalog)."""
+def setup_emr_tables(spark):
+    """Create and populate test tables in EMR (Iceberg catalog) — baseline data."""
     print("Setting up EMR tables...")
 
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {EMR_CATALOG}.{EMR_DB}")
 
-    # 1. test_pk_nopart
-    full_name = f"{EMR_CATALOG}.{EMR_DB}.test_pk_nopart"
-    spark.sql(f"DROP TABLE IF EXISTS {full_name}")
-    spark.sql(f"""
-        CREATE TABLE {full_name} (
-            id INT, name STRING, value INT
-        ) USING iceberg
-    """)
-    spark.sql(f"""
-        INSERT INTO {full_name} VALUES
-        (1, 'alice', 100),
-        (2, 'bob', 200),
-        (3, 'charlie', 300),
-        (4, 'david', 400),
-        (5, 'eve', 500)
-    """)
-    print(f"  Created {full_name}")
-
-    # 2. test_pk_part
-    full_name = f"{EMR_CATALOG}.{EMR_DB}.test_pk_part"
-    spark.sql(f"DROP TABLE IF EXISTS {full_name}")
-    spark.sql(f"""
-        CREATE TABLE {full_name} (
-            id INT, name STRING, amount INT, pt STRING
-        ) USING iceberg PARTITIONED BY (pt)
-    """)
-    spark.sql(f"""
-        INSERT INTO {full_name} VALUES
-        (1, 'alice', 10, '20250101'),
-        (2, 'bob', 20, '20250101'),
-        (3, 'charlie', 30, '20250102'),
-        (4, 'david', 40, '20250102'),
-        (5, 'eve', 50, '20250103')
-    """)
-    print(f"  Created {full_name}")
-
-    # 3. test_nopk_nopart
+    # 1. test_nopk_nopart — same baseline as Databricks before modifications
     full_name = f"{EMR_CATALOG}.{EMR_DB}.test_nopk_nopart"
     spark.sql(f"DROP TABLE IF EXISTS {full_name}")
     spark.sql(f"""
         CREATE TABLE {full_name} (
-            event STRING, ts STRING, payload STRING
+            id INT, name STRING, value DOUBLE, score INT
         ) USING iceberg
     """)
     spark.sql(f"""
         INSERT INTO {full_name} VALUES
-        ('click', '2025-01-01 00:00:00', '{{"page":"home"}}'),
-        ('view', '2025-01-01 00:01:00', '{{"page":"about"}}'),
-        ('click', '2025-01-01 00:02:00', '{{"page":"shop"}}')
+        (1, 'alice', 10.5, 80),
+        (2, 'bob', 20.3, 90),
+        (3, 'charlie', 30.7, 85),
+        (4, 'david', 40.1, 70),
+        (5, 'eve', 50.9, 95)
     """)
-    print(f"  Created {full_name}")
+    print(f"  Created {full_name} (5 rows, original data)")
 
-    # 4. test_nopk_part
+    # 2. test_nopk_part — same baseline
     full_name = f"{EMR_CATALOG}.{EMR_DB}.test_nopk_part"
     spark.sql(f"DROP TABLE IF EXISTS {full_name}")
     spark.sql(f"""
         CREATE TABLE {full_name} (
-            event STRING, ts STRING, payload STRING, pt STRING
+            id INT, name STRING, amount DOUBLE, score INT, pt STRING
         ) USING iceberg PARTITIONED BY (pt)
     """)
     spark.sql(f"""
         INSERT INTO {full_name} VALUES
-        ('click', '2025-01-01 00:00:00', '{{"p":"a"}}', '20250101'),
-        ('view', '2025-01-01 00:01:00', '{{"p":"b"}}', '20250101'),
-        ('click', '2025-01-02 00:00:00', '{{"p":"c"}}', '20250102'),
-        ('view', '2025-01-02 00:01:00', '{{"p":"d"}}', '20250102')
+        (1, 'alice', 100.0, 80, '20250101'),
+        (2, 'bob', 200.0, 90, '20250101'),
+        (3, 'charlie', 150.0, 85, '20250101'),
+        (4, 'david', 300.0, 70, '20250102'),
+        (5, 'eve', 250.0, 95, '20250102'),
+        (6, 'frank', 180.0, 88, '20250102')
     """)
-    print(f"  Created {full_name}")
+    print(f"  Created {full_name} (6 rows, original data)")
 
-    print("EMR setup complete! (EMR has the 'original' data, Databricks has modifications)")
+    print("EMR setup complete! (EMR has baseline data, Databricks has modifications)")
 
 
 def main():
@@ -245,6 +164,7 @@ def main():
         setup_databricks_tables()
 
     if mode in ("emr", "all"):
+        from pyspark.sql import SparkSession
         spark = SparkSession.builder \
             .appName("SetupTestData") \
             .config("spark.sql.catalog.iceberg_catalog", "org.apache.iceberg.spark.SparkCatalog") \
@@ -256,10 +176,9 @@ def main():
         spark.stop()
 
     print("\nDone! Expected diffs when comparing:")
-    print("  test_pk_nopart: id=3 value mismatch (300 vs 999), id=6 only in DBX")
-    print("  test_pk_part: id=1 pt=20250101 amount mismatch (10 vs 99)")
-    print("  test_nopk_nopart: count 3(EMR) vs 4(DBX)")
-    print("  test_nopk_part: partition 20250103 only in DBX")
+    print("  test_nopk_nopart: count 5(ICE) vs 6(DELTA), value max 50.9(ICE) vs 99.9(DELTA)")
+    print("  test_nopk_part pt=20250101: amount max 200(ICE) vs 999(DELTA)")
+    print("  test_nopk_part pt=20250102: count 3(ICE) vs 4(DELTA)")
 
 
 if __name__ == "__main__":

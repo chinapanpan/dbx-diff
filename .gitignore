@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+task_plan.md
+findings.md
+progress.md
