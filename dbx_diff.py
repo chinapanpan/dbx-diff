@@ -195,12 +195,27 @@ def identify_numeric_columns(df: DataFrame) -> List[str]:
     return numeric_cols
 
 
-def compute_aggregates(df: DataFrame, numeric_cols: List[str]) -> DataFrame:
-    """Compute count, max, min, avg for each numeric column on a DataFrame.
+def build_agg_sql(table_name: str, numeric_cols: List[str], pt_keys: List[str] = None) -> str:
+    """Build the SQL string for aggregate comparison (for reporting purposes)."""
+    agg_parts = ["count(1) AS total_count"]
+    for col_name in numeric_cols:
+        agg_parts.append(f"max({col_name}) AS {col_name}_max")
+        agg_parts.append(f"min({col_name}) AS {col_name}_min")
+        agg_parts.append(f"avg({col_name}) AS {col_name}_avg")
+    select_clause = ",\n       ".join(agg_parts)
 
-    Returns a single-row DataFrame with columns:
-      total_count, {col}_max, {col}_min, {col}_avg for each numeric col.
-    """
+    if pt_keys:
+        pt_list = ", ".join(f"'{p}'" for p in pt_keys)
+        return (f"SELECT pt,\n       {select_clause}\n"
+                f"FROM {table_name}\n"
+                f"WHERE pt IN ({pt_list})\n"
+                f"GROUP BY pt\nORDER BY pt")
+    else:
+        return f"SELECT {select_clause}\nFROM {table_name}"
+
+
+def compute_aggregates(df: DataFrame, numeric_cols: List[str]) -> DataFrame:
+    """Compute count, max, min, avg for each numeric column on a DataFrame."""
     agg_exprs = [F.count(F.lit(1)).alias("total_count")]
     for col_name in numeric_cols:
         agg_exprs.append(F.max(F.col(col_name)).alias(f"{col_name}_max"))
@@ -210,10 +225,7 @@ def compute_aggregates(df: DataFrame, numeric_cols: List[str]) -> DataFrame:
 
 
 def compute_aggregates_by_partition(df: DataFrame, numeric_cols: List[str], pt_keys: List[str]) -> DataFrame:
-    """Compute count, max, min, avg for each numeric column grouped by pt partition.
-
-    Filters to only the specified pt_keys, then groups by pt.
-    """
+    """Compute count, max, min, avg for each numeric column grouped by pt partition."""
     df_filtered = df.filter(F.col("pt").isin(pt_keys))
     agg_exprs = [F.count(F.lit(1)).alias("total_count")]
     for col_name in numeric_cols:
@@ -232,7 +244,6 @@ def compare_aggregates_non_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
     diffs = []
     all_match = True
 
-    # Compare count
     if dbx_agg["total_count"] != emr_agg["total_count"]:
         diffs.append({
             "column": "*",
@@ -242,14 +253,12 @@ def compare_aggregates_non_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
         })
         all_match = False
 
-    # Compare numeric column aggregates
     for col_name in numeric_cols:
         for metric in ["max", "min", "avg"]:
             key = f"{col_name}_{metric}"
             dbx_val = dbx_agg.get(key)
             emr_val = emr_agg.get(key)
             if dbx_val != emr_val:
-                # Handle floating point comparison for avg
                 if metric == "avg" and dbx_val is not None and emr_val is not None:
                     if abs(float(dbx_val) - float(emr_val)) < 1e-6:
                         continue
@@ -261,12 +270,17 @@ def compare_aggregates_non_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
                 })
                 all_match = False
 
+    sql = build_agg_sql(table_name, numeric_cols)
+
     return {
         "table": table_name,
         "partitioned": False,
         "dbx_count": dbx_agg["total_count"],
         "emr_count": emr_agg["total_count"],
         "numeric_cols": numeric_cols,
+        "dbx_agg": dbx_agg,
+        "emr_agg": emr_agg,
+        "sql": sql,
         "diffs": diffs,
         "match": all_match,
     }
@@ -298,7 +312,6 @@ def compare_aggregates_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
             pt_diffs.append({"column": "*", "metric": "partition", "delta_value": "EXISTS", "iceberg_value": "MISSING"})
             all_match = False
         else:
-            # Compare count
             if dbx_data.get("total_count") != emr_data.get("total_count"):
                 pt_diffs.append({
                     "column": "*",
@@ -308,7 +321,6 @@ def compare_aggregates_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
                 })
                 all_match = False
 
-            # Compare numeric aggregates
             for col_name in numeric_cols:
                 for metric in ["max", "min", "avg"]:
                     key = f"{col_name}_{metric}"
@@ -328,17 +340,22 @@ def compare_aggregates_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
 
         partition_results.append({
             "pt": pt_val,
+            "dbx_data": dbx_data,
+            "emr_data": emr_data,
             "dbx_count": dbx_data.get("total_count", 0),
             "emr_count": emr_data.get("total_count", 0),
             "diffs": pt_diffs,
             "match": len(pt_diffs) == 0,
         })
 
+    sql = build_agg_sql(table_name, numeric_cols, pt_keys)
+
     return {
         "table": table_name,
         "partitioned": True,
         "pt_keys": pt_keys,
         "numeric_cols": numeric_cols,
+        "sql": sql,
         "partition_results": partition_results,
         "match": all_match,
     }
@@ -348,17 +365,37 @@ def format_non_partitioned_result_md(result: Dict) -> str:
     """Format non-partitioned aggregate comparison result as Markdown."""
     status = "PASS" if result['match'] else "FAIL"
     md = f"\n### {result['table']} — Aggregate Check: **{status}**\n\n"
-    md += f"- Numeric columns: `{result['numeric_cols']}`\n"
-    md += f"- Delta count: {result['dbx_count']}, Iceberg count: {result['emr_count']}\n\n"
 
-    if result['match']:
-        md += "> All aggregate values match.\n"
-        return md
+    # SQL
+    md += f"**SQL:**\n```sql\n{result['sql']}\n```\n\n"
 
-    md += "| Column | Metric | Delta Value | Iceberg Value |\n"
-    md += "|--------|--------|-------------|---------------|\n"
-    for diff in result['diffs']:
-        md += f"| {diff['column']} | {diff['metric']} | {diff['delta_value']} | {diff['iceberg_value']} |\n"
+    # Full results from both engines
+    numeric_cols = result['numeric_cols']
+    dbx_agg = result['dbx_agg']
+    emr_agg = result['emr_agg']
+
+    md += "**Results:**\n\n"
+    md += "| Column | Metric | Delta | Iceberg | Match |\n"
+    md += "|--------|--------|-------|---------|-------|\n"
+    # count row
+    count_match = dbx_agg["total_count"] == emr_agg["total_count"]
+    md += f"| * | count | {dbx_agg['total_count']} | {emr_agg['total_count']} | {'Y' if count_match else 'N'} |\n"
+    for col_name in numeric_cols:
+        for metric in ["max", "min", "avg"]:
+            key = f"{col_name}_{metric}"
+            dbx_val = dbx_agg.get(key)
+            emr_val = emr_agg.get(key)
+            match = dbx_val == emr_val
+            if metric == "avg" and dbx_val is not None and emr_val is not None:
+                match = abs(float(dbx_val) - float(emr_val)) < 1e-6
+            md += f"| {col_name} | {metric} | {dbx_val} | {emr_val} | {'Y' if match else 'N'} |\n"
+
+    # Conclusion
+    md += f"\n**Conclusion: {status}**\n"
+    if not result['match']:
+        md += "\nDifferences:\n"
+        for diff in result['diffs']:
+            md += f"- `{diff['column']}`.{diff['metric']}: Delta={diff['delta_value']}, Iceberg={diff['iceberg_value']}\n"
 
     return md
 
@@ -367,23 +404,42 @@ def format_partitioned_result_md(result: Dict) -> str:
     """Format partitioned aggregate comparison result as Markdown."""
     status = "PASS" if result['match'] else "FAIL"
     md = f"\n### {result['table']} — Partitioned Aggregate Check: **{status}**\n\n"
-    md += f"- Numeric columns: `{result['numeric_cols']}`\n"
-    md += f"- Partitions checked: `{result['pt_keys']}`\n\n"
 
-    if result['match']:
-        md += "> All partition aggregate values match.\n"
-        return md
+    # SQL
+    md += f"**SQL:**\n```sql\n{result['sql']}\n```\n\n"
+
+    numeric_cols = result['numeric_cols']
 
     for pr in result['partition_results']:
         pt_status = "PASS" if pr['match'] else "FAIL"
         md += f"\n#### Partition pt={pr['pt']} — **{pt_status}**\n\n"
-        md += f"- Delta count: {pr['dbx_count']}, Iceberg count: {pr['emr_count']}\n"
+
+        dbx_data = pr.get('dbx_data', {})
+        emr_data = pr.get('emr_data', {})
+
+        md += "| Column | Metric | Delta | Iceberg | Match |\n"
+        md += "|--------|--------|-------|---------|-------|\n"
+        # count row
+        dbx_count = dbx_data.get("total_count", 0)
+        emr_count = emr_data.get("total_count", 0)
+        count_match = dbx_count == emr_count
+        md += f"| * | count | {dbx_count} | {emr_count} | {'Y' if count_match else 'N'} |\n"
+        for col_name in numeric_cols:
+            for metric in ["max", "min", "avg"]:
+                key = f"{col_name}_{metric}"
+                dbx_val = dbx_data.get(key)
+                emr_val = emr_data.get(key)
+                match = dbx_val == emr_val
+                if metric == "avg" and dbx_val is not None and emr_val is not None:
+                    match = abs(float(dbx_val) - float(emr_val)) < 1e-6
+                md += f"| {col_name} | {metric} | {dbx_val} | {emr_val} | {'Y' if match else 'N'} |\n"
 
         if pr['diffs']:
-            md += "\n| Column | Metric | Delta Value | Iceberg Value |\n"
-            md += "|--------|--------|-------------|---------------|\n"
+            md += f"\nDifferences:\n"
             for diff in pr['diffs']:
-                md += f"| {diff['column']} | {diff['metric']} | {diff['delta_value']} | {diff['iceberg_value']} |\n"
+                md += f"- `{diff['column']}`.{diff['metric']}: Delta={diff['delta_value']}, Iceberg={diff['iceberg_value']}\n"
+
+    md += f"\n**Conclusion: {status}**\n"
 
     return md
 
