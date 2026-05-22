@@ -43,7 +43,6 @@ DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "")
 DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 MAX_WORKERS = 15
 TIMEOUT_PER_TABLE = 600
-EMR_CATALOG = "iceberg_catalog"
 
 _write_lock = threading.Lock()
 _token_lock = threading.Lock()
@@ -53,24 +52,11 @@ _oauth2_expiry = 0
 NUMERIC_TYPES = (IntegerType, LongType, FloatType, DoubleType, DecimalType, ShortType, ByteType)
 
 
-def map_to_emr_table(dbx_table_name: str, emr_catalog: str) -> str:
-    """Map Databricks table name (catalog.schema.table) to EMR table name."""
-    parts = dbx_table_name.split(".")
-    if len(parts) == 3:
-        return f"{emr_catalog}.{parts[1]}.{parts[2]}"
-    return dbx_table_name
 
-
-def get_spark(emr_catalog: str = "iceberg_catalog", warehouse: str = "s3://zpf-databricks-event/emr/demo2") -> SparkSession:
-    """Get or create SparkSession."""
+def get_spark() -> SparkSession:
+    """Get or create SparkSession. Catalog configs are set at EMR Serverless Application level."""
     return SparkSession.builder \
         .appName("DbxDiff") \
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-        .config(f"spark.sql.catalog.{emr_catalog}", "org.apache.iceberg.spark.SparkCatalog") \
-        .config(f"spark.sql.catalog.{emr_catalog}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
-        .config(f"spark.sql.catalog.{emr_catalog}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
-        .config(f"spark.sql.catalog.{emr_catalog}.warehouse", warehouse) \
         .getOrCreate()
 
 
@@ -402,7 +388,7 @@ def format_partitioned_result_md(result: Dict) -> str:
     return md
 
 
-def compare_single_table(spark: SparkSession, config: Dict, report_path: str, emr_catalog: str,
+def compare_single_table(spark: SparkSession, config: Dict, report_path: str,
                          table_metadata: Dict = None):
     """Compare a single table between Databricks (Delta) and EMR (Iceberg).
 
@@ -412,7 +398,6 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str, em
     - Partitioned: filter by pt_keys, group by pt, compute max, min, avg, count
     """
     table_name = config['table_name']
-    emr_table_name = map_to_emr_table(table_name, emr_catalog)
     pt_keys = [k.strip() for k in config['pt_keys'].split(',') if k.strip()] if config['pt_keys'] else []
 
     meta = table_metadata or {}
@@ -421,7 +406,6 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str, em
 
     start_time = time.time()
     md_content = f"\n---\n## Table: `{table_name}`\n"
-    md_content += f"- EMR table: `{emr_table_name}`\n"
     md_content += f"- Partitioned: {'Yes (pt)' if is_partitioned else 'No'}\n"
     if is_partitioned and pt_keys:
         md_content += f"- pt_keys: `{pt_keys}`\n"
@@ -436,7 +420,7 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str, em
             raise Exception(f"No storage_location found for table {table_name}")
 
         df_dbx = read_delta_table(spark, dbx_location)
-        df_emr = read_emr_table(spark, emr_table_name)
+        df_emr = read_emr_table(spark, table_name)
 
         # Identify numeric columns from Delta table schema
         numeric_cols = identify_numeric_columns(df_dbx)
@@ -487,8 +471,6 @@ def main():
     parser.add_argument("--s3-output", required=True, help="S3 path for output report")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"Max parallel workers (default: {MAX_WORKERS})")
     parser.add_argument("--timeout", type=int, default=TIMEOUT_PER_TABLE, help=f"Timeout per table in seconds (default: {TIMEOUT_PER_TABLE})")
-    parser.add_argument("--emr-catalog", default=EMR_CATALOG, help=f"EMR catalog name (default: {EMR_CATALOG})")
-    parser.add_argument("--emr-warehouse", default="s3://zpf-databricks-event/emr/demo2", help="EMR Iceberg warehouse location")
     parser.add_argument("--databricks-host", default=None, help="Databricks workspace URL")
     parser.add_argument("--databricks-token", default=None, help="Databricks access token")
     parser.add_argument("--databricks-secret-arn", default=None, help="AWS Secrets Manager ARN for OAuth2")
@@ -512,7 +494,7 @@ def main():
         print("ERROR: Databricks host and credentials must be provided", file=sys.stderr)
         sys.exit(1)
 
-    spark = get_spark(emr_catalog=args.emr_catalog, warehouse=args.emr_warehouse)
+    spark = get_spark()
 
     configs = parse_csv(args.csv)
     print(f"Loaded {len(configs)} table configs from {args.csv}")
@@ -536,7 +518,7 @@ def main():
         futures = {}
         for config in configs:
             table_meta = all_metadata.get(config['table_name'], {})
-            future = executor.submit(compare_single_table, spark, config, report_path, args.emr_catalog, table_meta)
+            future = executor.submit(compare_single_table, spark, config, report_path, table_meta)
             futures[future] = config['table_name']
 
         for future in as_completed(futures):
