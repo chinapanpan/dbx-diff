@@ -95,12 +95,17 @@ python3 submit_job.py \
 | `primary_keys` | 否 | 主键列，逗号分隔（如 `id,name`），当前版本保留字段 |
 | `pt_keys` | 否 | 需精细对比的具体分区值，逗号分隔（如 `20250101,20250102`） |
 
-示例：
+示例（每列之间用**一个空格**分隔，空值用连续空格跳过）：
 ```
 table_name primary_keys pt_keys
 workspace.demo2.test_nopk_nopart
 workspace.demo2.test_nopk_part  20250101,20250102
+workspace.demo2.test_with_pk id,name 20250101,20250102
 ```
+
+> 注意第2行：`test_nopk_part` 与 `20250101,20250102` 之间有**两个空格**，
+> 表示 `primary_keys` 为空、`pt_keys` 为 `20250101,20250102`。
+> 若只有一个空格，则 `20250101,20250102` 会被解析为 `primary_keys` 列。
 
 ## 比较规则
 
