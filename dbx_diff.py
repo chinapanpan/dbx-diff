@@ -1,7 +1,7 @@
 """
 Databricks vs EMR Data Comparison Tool (v3 - Aggregate Based).
 
-Compares numeric column aggregates (max, min, avg, count) between
+Compares numeric column aggregates (count, sum, max, min, avg) between
 Databricks (Delta on S3) and EMR (Iceberg via Glue catalog).
 """
 
@@ -199,6 +199,7 @@ def build_agg_sql(table_name: str, numeric_cols: List[str], pt_keys: List[str] =
     """Build the SQL string for aggregate comparison (for reporting purposes)."""
     agg_parts = ["count(1) AS total_count"]
     for col_name in numeric_cols:
+        agg_parts.append(f"sum({col_name}) AS {col_name}_sum")
         agg_parts.append(f"max({col_name}) AS {col_name}_max")
         agg_parts.append(f"min({col_name}) AS {col_name}_min")
         agg_parts.append(f"avg({col_name}) AS {col_name}_avg")
@@ -215,9 +216,10 @@ def build_agg_sql(table_name: str, numeric_cols: List[str], pt_keys: List[str] =
 
 
 def compute_aggregates(df: DataFrame, numeric_cols: List[str]) -> DataFrame:
-    """Compute count, max, min, avg for each numeric column on a DataFrame."""
+    """Compute count, sum, max, min, avg for each numeric column on a DataFrame."""
     agg_exprs = [F.count(F.lit(1)).alias("total_count")]
     for col_name in numeric_cols:
+        agg_exprs.append(F.sum(F.col(col_name)).alias(f"{col_name}_sum"))
         agg_exprs.append(F.max(F.col(col_name)).alias(f"{col_name}_max"))
         agg_exprs.append(F.min(F.col(col_name)).alias(f"{col_name}_min"))
         agg_exprs.append(F.avg(F.col(col_name)).alias(f"{col_name}_avg"))
@@ -225,10 +227,11 @@ def compute_aggregates(df: DataFrame, numeric_cols: List[str]) -> DataFrame:
 
 
 def compute_aggregates_by_partition(df: DataFrame, numeric_cols: List[str], pt_keys: List[str]) -> DataFrame:
-    """Compute count, max, min, avg for each numeric column grouped by pt partition."""
+    """Compute count, sum, max, min, avg for each numeric column grouped by pt partition."""
     df_filtered = df.filter(F.col("pt").isin(pt_keys))
     agg_exprs = [F.count(F.lit(1)).alias("total_count")]
     for col_name in numeric_cols:
+        agg_exprs.append(F.sum(F.col(col_name)).alias(f"{col_name}_sum"))
         agg_exprs.append(F.max(F.col(col_name)).alias(f"{col_name}_max"))
         agg_exprs.append(F.min(F.col(col_name)).alias(f"{col_name}_min"))
         agg_exprs.append(F.avg(F.col(col_name)).alias(f"{col_name}_avg"))
@@ -254,7 +257,7 @@ def compare_aggregates_non_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
         all_match = False
 
     for col_name in numeric_cols:
-        for metric in ["max", "min", "avg"]:
+        for metric in ["sum", "max", "min", "avg"]:
             key = f"{col_name}_{metric}"
             dbx_val = dbx_agg.get(key)
             emr_val = emr_agg.get(key)
@@ -322,7 +325,7 @@ def compare_aggregates_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
                 all_match = False
 
             for col_name in numeric_cols:
-                for metric in ["max", "min", "avg"]:
+                for metric in ["sum", "max", "min", "avg"]:
                     key = f"{col_name}_{metric}"
                     dbx_val = dbx_data.get(key)
                     emr_val = emr_data.get(key)
@@ -381,7 +384,7 @@ def format_non_partitioned_result_md(result: Dict) -> str:
     count_match = dbx_agg["total_count"] == emr_agg["total_count"]
     md += f"| * | count | {dbx_agg['total_count']} | {emr_agg['total_count']} | {'Y' if count_match else 'N'} |\n"
     for col_name in numeric_cols:
-        for metric in ["max", "min", "avg"]:
+        for metric in ["sum", "max", "min", "avg"]:
             key = f"{col_name}_{metric}"
             dbx_val = dbx_agg.get(key)
             emr_val = emr_agg.get(key)
@@ -425,7 +428,7 @@ def format_partitioned_result_md(result: Dict) -> str:
         count_match = dbx_count == emr_count
         md += f"| * | count | {dbx_count} | {emr_count} | {'Y' if count_match else 'N'} |\n"
         for col_name in numeric_cols:
-            for metric in ["max", "min", "avg"]:
+            for metric in ["sum", "max", "min", "avg"]:
                 key = f"{col_name}_{metric}"
                 dbx_val = dbx_data.get(key)
                 emr_val = emr_data.get(key)
@@ -450,8 +453,8 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str,
 
     Logic:
     - Determine if partitioned by checking if 'pt' is in partition_cols (from Delta metadata)
-    - Non-partitioned: compute max, min, avg, count on numeric columns for both sides
-    - Partitioned: filter by pt_keys, group by pt, compute max, min, avg, count
+    - Non-partitioned: compute count, sum, max, min, avg on numeric columns for both sides
+    - Partitioned: filter by pt_keys, group by pt, compute count, sum, max, min, avg
     """
     table_name = config['table_name']
     pt_keys = [k.strip() for k in config['pt_keys'].split(',') if k.strip()] if config['pt_keys'] else []
