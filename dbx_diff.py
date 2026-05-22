@@ -195,6 +195,15 @@ def identify_numeric_columns(df: DataFrame) -> List[str]:
     return numeric_cols
 
 
+def get_column_types(df: DataFrame, numeric_cols: List[str]) -> Dict[str, str]:
+    """Get data type names for numeric columns."""
+    type_map = {}
+    for field in df.schema.fields:
+        if field.name in numeric_cols:
+            type_map[field.name] = field.dataType.simpleString()
+    return type_map
+
+
 def build_agg_sql(table_name: str, numeric_cols: List[str], pt_keys: List[str] = None) -> str:
     """Build the SQL string for aggregate comparison (for reporting purposes)."""
     agg_parts = ["count(1) AS total_count"]
@@ -239,7 +248,8 @@ def compute_aggregates_by_partition(df: DataFrame, numeric_cols: List[str], pt_k
 
 
 def compare_aggregates_non_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
-                                        numeric_cols: List[str], table_name: str) -> Dict:
+                                        numeric_cols: List[str], col_types: Dict[str, str],
+                                        table_name: str) -> Dict:
     """Compare aggregate stats for a non-partitioned table."""
     dbx_agg = compute_aggregates(df_dbx, numeric_cols).collect()[0].asDict()
     emr_agg = compute_aggregates(df_emr, numeric_cols).collect()[0].asDict()
@@ -281,6 +291,7 @@ def compare_aggregates_non_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
         "dbx_count": dbx_agg["total_count"],
         "emr_count": emr_agg["total_count"],
         "numeric_cols": numeric_cols,
+        "col_types": col_types,
         "dbx_agg": dbx_agg,
         "emr_agg": emr_agg,
         "sql": sql,
@@ -290,7 +301,8 @@ def compare_aggregates_non_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
 
 
 def compare_aggregates_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
-                                    numeric_cols: List[str], pt_keys: List[str],
+                                    numeric_cols: List[str], col_types: Dict[str, str],
+                                    pt_keys: List[str],
                                     table_name: str) -> Dict:
     """Compare aggregate stats for a partitioned table, grouped by pt."""
     dbx_agg_df = compute_aggregates_by_partition(df_dbx, numeric_cols, pt_keys)
@@ -358,6 +370,7 @@ def compare_aggregates_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
         "partitioned": True,
         "pt_keys": pt_keys,
         "numeric_cols": numeric_cols,
+        "col_types": col_types,
         "sql": sql,
         "partition_results": partition_results,
         "match": all_match,
@@ -377,13 +390,15 @@ def format_non_partitioned_result_md(result: Dict) -> str:
     dbx_agg = result['dbx_agg']
     emr_agg = result['emr_agg']
 
+    col_types = result.get('col_types', {})
+
     md += "**Results:**\n\n"
-    md += "| Column | Metric | Delta | Iceberg | Match |\n"
-    md += "|--------|--------|-------|---------|-------|\n"
-    # count row
+    md += "| Column | Type | Metric | Delta | Iceberg | Match |\n"
+    md += "|--------|------|--------|-------|---------|-------|\n"
     count_match = dbx_agg["total_count"] == emr_agg["total_count"]
-    md += f"| * | count | {dbx_agg['total_count']} | {emr_agg['total_count']} | {'Y' if count_match else 'N'} |\n"
+    md += f"| * | - | count | {dbx_agg['total_count']} | {emr_agg['total_count']} | {'Y' if count_match else 'N'} |\n"
     for col_name in numeric_cols:
+        col_type = col_types.get(col_name, "")
         for metric in ["sum", "max", "min", "avg"]:
             key = f"{col_name}_{metric}"
             dbx_val = dbx_agg.get(key)
@@ -391,7 +406,7 @@ def format_non_partitioned_result_md(result: Dict) -> str:
             match = dbx_val == emr_val
             if metric == "avg" and dbx_val is not None and emr_val is not None:
                 match = abs(float(dbx_val) - float(emr_val)) < 1e-6
-            md += f"| {col_name} | {metric} | {dbx_val} | {emr_val} | {'Y' if match else 'N'} |\n"
+            md += f"| {col_name} | {col_type} | {metric} | {dbx_val} | {emr_val} | {'Y' if match else 'N'} |\n"
 
     # Conclusion
     md += f"\n**Conclusion: {status}**\n"
@@ -412,6 +427,7 @@ def format_partitioned_result_md(result: Dict) -> str:
     md += f"**SQL:**\n```sql\n{result['sql']}\n```\n\n"
 
     numeric_cols = result['numeric_cols']
+    col_types = result.get('col_types', {})
 
     for pr in result['partition_results']:
         pt_status = "PASS" if pr['match'] else "FAIL"
@@ -420,14 +436,14 @@ def format_partitioned_result_md(result: Dict) -> str:
         dbx_data = pr.get('dbx_data', {})
         emr_data = pr.get('emr_data', {})
 
-        md += "| Column | Metric | Delta | Iceberg | Match |\n"
-        md += "|--------|--------|-------|---------|-------|\n"
-        # count row
+        md += "| Column | Type | Metric | Delta | Iceberg | Match |\n"
+        md += "|--------|------|--------|-------|---------|-------|\n"
         dbx_count = dbx_data.get("total_count", 0)
         emr_count = emr_data.get("total_count", 0)
         count_match = dbx_count == emr_count
-        md += f"| * | count | {dbx_count} | {emr_count} | {'Y' if count_match else 'N'} |\n"
+        md += f"| * | - | count | {dbx_count} | {emr_count} | {'Y' if count_match else 'N'} |\n"
         for col_name in numeric_cols:
+            col_type = col_types.get(col_name, "")
             for metric in ["sum", "max", "min", "avg"]:
                 key = f"{col_name}_{metric}"
                 dbx_val = dbx_data.get(key)
@@ -435,7 +451,7 @@ def format_partitioned_result_md(result: Dict) -> str:
                 match = dbx_val == emr_val
                 if metric == "avg" and dbx_val is not None and emr_val is not None:
                     match = abs(float(dbx_val) - float(emr_val)) < 1e-6
-                md += f"| {col_name} | {metric} | {dbx_val} | {emr_val} | {'Y' if match else 'N'} |\n"
+                md += f"| {col_name} | {col_type} | {metric} | {dbx_val} | {emr_val} | {'Y' if match else 'N'} |\n"
 
         if pr['diffs']:
             md += f"\nDifferences:\n"
@@ -499,17 +515,18 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str,
             append_md(report_path, result_md)
         elif not is_partitioned:
             # Non-partitioned: full aggregate comparison
-            result = compare_aggregates_non_partitioned(df_dbx, df_emr, numeric_cols, table_name)
+            col_types = get_column_types(df_dbx, numeric_cols)
+            result = compare_aggregates_non_partitioned(df_dbx, df_emr, numeric_cols, col_types, table_name)
             append_md(report_path, format_non_partitioned_result_md(result))
         else:
             # Partitioned: aggregate by pt
+            col_types = get_column_types(df_dbx, numeric_cols)
             if not pt_keys:
-                # No specific pt_keys — compare all partitions
                 dbx_pts = [row["pt"] for row in df_dbx.select("pt").distinct().collect()]
                 emr_pts = [row["pt"] for row in df_emr.select("pt").distinct().collect()]
                 pt_keys = sorted(set(dbx_pts + emr_pts))
 
-            result = compare_aggregates_partitioned(df_dbx, df_emr, numeric_cols, pt_keys, table_name)
+            result = compare_aggregates_partitioned(df_dbx, df_emr, numeric_cols, col_types, pt_keys, table_name)
             append_md(report_path, format_partitioned_result_md(result))
 
         elapsed = time.time() - start_time
