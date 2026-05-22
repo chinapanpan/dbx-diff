@@ -558,6 +558,15 @@ def main():
     summary += f"- Total time: {prefetch_elapsed + total_elapsed:.1f}s\n"
     append_md(report_path, summary)
 
+    # Print report to driver log (stdout)
+    with open(report_path, 'r') as f:
+        report_content = f.read()
+    print("\n" + "=" * 80)
+    print("REPORT OUTPUT:")
+    print("=" * 80)
+    print(report_content)
+    print("=" * 80 + "\n")
+
     upload_to_s3(report_path, args.s3_output)
     os.remove(report_path)
     spark.stop()
