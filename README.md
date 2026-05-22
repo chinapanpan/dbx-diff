@@ -46,90 +46,28 @@
 
 ### 前置条件
 
-- EMR Serverless 7.12 应用（emr-7.12.0）
+- EMR Serverless 7.12 应用（emr-7.12.0），已配置好 Spark 相关参数
 - Databricks workspace（启用 Unity Catalog）
 - S3 存储桶（用于代码和报告）
 - Lake Formation 权限（EMR 角色需有 Glue Catalog 访问权限）
-- Python 3.12 venv 打包上传至 S3
 
-### 提交作业（OAuth2 认证，推荐）
+### 提交作业
 
 ```bash
 python3 submit_job.py \
-  --mode serverless \
   --csv s3://your-bucket/code/tables.csv \
   --s3-output s3://your-bucket/reports/diff_report.md \
   --databricks-host https://your-workspace.cloud.databricks.com \
   --databricks-secret-arn arn:aws:secretsmanager:us-west-2:<account>:secret:<name>
 ```
 
-`--databricks-secret-arn` 指向 AWS Secrets Manager 中存储的明文凭证，格式为 `client_id:client_secret`。程序通过 OAuth2 client_credentials 流获取 Databricks 访问令牌。
-
 `submit_job.py` 内部通过 `emr_common.Session` 完成以下流程：
 1. 自动将 `dbx_diff.py` 上传至 S3
-2. 构造 spark-submit 参数（含 spark.archives venv、Iceberg catalog 配置等）
+2. 传入运行时环境变量（Databricks 凭证）
 3. 调用 `session.submit_file()` 提交作业
 4. 轮询等待完成，输出 Spark UI 链接
 
-## emr_common.Session 使用说明
-
-`submit_job.py` 基于 `emr_common.py` 中的 `Session` 类提交 EMR Serverless 作业。
-
-### 基本用法
-
-```python
-from emr_common import Session
-
-session = Session(
-    application_id="00g5qqg0spv6bq0l",       # EMR Serverless 应用 ID
-    jobtype=1,                                 # 1=Serverless
-    region="us-west-2",
-    job_role="arn:aws:iam::<account>:role/EMRServerlessExecutionRole",
-    logs_s3_path="s3://your-bucket/logs/",
-    script_s3_path="s3://your-bucket/code/",
-    spark_conf="--conf spark.executor.memory=4g --conf spark.executor.cores=4",
-)
-
-# 提交本地脚本（自动上传至 S3 并等待完成）
-result = session.submit_file(
-    jobname="dbx_diff",
-    local_file="/path/to/dbx_diff.py",
-    args=["--csv", "s3://bucket/tables.csv", "--s3-output", "s3://bucket/report.md"],
-)
-
-print(f"状态: {result.status}")  # SUCCESS / FAILED
-print(f"Job ID: {result.job_run_id}")
-```
-
-### Session 参数
-
-| 参数 | 说明 |
-|------|------|
-| `application_id` | EMR Serverless 应用 ID（留空则自动获取第一个可用应用） |
-| `jobtype` | 1=EMR Serverless |
-| `region` | AWS 区域 |
-| `job_role` | EMR Serverless 执行角色 ARN |
-| `logs_s3_path` | 日志存储 S3 路径 |
-| `script_s3_path` | 脚本上传 S3 路径前缀 |
-| `spark_conf` | spark-submit 参数字符串（`--conf key=value` 格式） |
-
-### submit_file 工作流程
-
-```
-submit_file(jobname, local_file, args)
-    │
-    ├── 1. 上传本地脚本至 S3（带时间戳，如 20260521_dbx_diff.py）
-    ├── 2. 构造 sparkSubmit jobDriver 配置
-    ├── 3. 调用 start_job_run 提交作业
-    ├── 4. 轮询作业状态（每 10s）直到终态
-    ├── 5. 输出 Spark UI 链接
-    └── 6. 返回 EMRResult(job_run_id, status)
-```
-
-### 注意事项
-
-- 使用 `spark.archives` 分发 Python 3.12 venv 时，`configurationOverrides` 必须使用 `managedPersistenceMonitoringConfiguration`（不能使用 `s3MonitoringConfiguration`，否则与 `PYTHONHOME` 冲突导致 `No module named 'encodings'`）
-- `spark_conf` 中需包含完整的 spark-submit 参数，包括 venv 分发、环境变量、catalog 配置等
+> Spark 基础配置（Iceberg catalog、Python venv、动态分配等）已在 EMR Serverless Application 级别预配置，`submit_job.py` 仅传入业务参数。
 
 ## 命令行参数
 
@@ -142,11 +80,8 @@ submit_file(jobname, local_file, args)
 | `--databricks-token` | 无 | Databricks PAT（备选，secret-arn 优先） |
 | `--workers` | 15 | 并行 worker 数 |
 | `--timeout` | 600 | 单表超时时间（秒） |
-| `--emr-catalog` | `iceberg_catalog` | EMR Iceberg catalog 名称 |
-| `--emr-warehouse` | `s3://zpf-databricks-event/emr/demo2` | Iceberg warehouse 路径 |
 | `--application-id` | （内置默认值） | EMR Serverless 应用 ID |
 | `--execution-role-arn` | （内置默认值） | EMR Serverless 执行角色 ARN |
-| `--venv-archive` | （内置默认值） | Python 3.12 venv tar.gz 的 S3 路径 |
 
 ## 输入 CSV 格式
 
@@ -209,11 +144,6 @@ Markdown 格式报告，实时追加写入，最终上传至 S3。示例：
 2. 将凭证存入 AWS Secrets Manager，格式为明文 `client_id:client_secret`
 3. 通过 `--databricks-secret-arn` 传入 Secret ARN
 
-```bash
-# 认证流程
---databricks-secret-arn arn:aws:secretsmanager:us-west-2:415797100173:secret:databricks-lnLMCq
-```
-
 程序内部调用：
 ```python
 # 1. 从 Secrets Manager 获取凭证
@@ -228,7 +158,35 @@ headers = {"Authorization": f"Bearer {token}"}
 
 备选方式：通过 `--databricks-token` 传入 Personal Access Token（不推荐用于生产）
 
-## EMR Serverless 部署
+## EMR Serverless Application 配置
+
+Spark 相关配置已在 Application 级别通过 `runtimeConfiguration` 预配置，无需在提交作业时重复指定：
+
+```json
+{
+  "classification": "spark-defaults",
+  "properties": {
+    "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+    "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+    "spark.sql.catalog.iceberg_catalog": "org.apache.iceberg.spark.SparkCatalog",
+    "spark.sql.catalog.iceberg_catalog.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
+    "spark.sql.catalog.iceberg_catalog.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+    "spark.sql.catalog.iceberg_catalog.warehouse": "s3://your-bucket/emr/warehouse",
+    "spark.executor.memory": "4g",
+    "spark.executor.cores": "4",
+    "spark.dynamicAllocation.enabled": "true",
+    "spark.dynamicAllocation.maxExecutors": "50",
+    "spark.archives": "s3://your-bucket/code/pyspark_py312_venv.tar.gz#environment",
+    "spark.emr-serverless.driverEnv.PYSPARK_DRIVER_PYTHON": "./environment/bin/python3.12",
+    "spark.emr-serverless.driverEnv.PYSPARK_PYTHON": "./environment/bin/python3.12",
+    "spark.executorEnv.PYSPARK_PYTHON": "./environment/bin/python3.12",
+    "spark.emr-serverless.driverEnv.LD_LIBRARY_PATH": "./environment/lib",
+    "spark.executorEnv.LD_LIBRARY_PATH": "./environment/lib",
+    "spark.emr-serverless.driverEnv.PYTHONHOME": "./environment",
+    "spark.executorEnv.PYTHONHOME": "./environment"
+  }
+}
+```
 
 ### 环境要求
 
@@ -236,11 +194,9 @@ headers = {"Authorization": f"Bearer {token}"}
 2. VPC 配置 NAT Gateway（用于访问 Databricks API）
 3. VPC 中配置 S3 Gateway Endpoint 和 Glue Interface Endpoint
 4. Lake Formation 为执行角色授权
-5. Python 3.12 venv 打包上传至 S3
+5. 执行角色需有 Secrets Manager `GetSecretValue` 权限
 
 ### Python 3.12 Venv 打包
-
-EMR Serverless 通过 `spark.archives` 分发自定义 Python 环境：
 
 ```bash
 # 创建 venv
@@ -267,20 +223,44 @@ tar -czf /tmp/pyspark_py312_venv.tar.gz .
 aws s3 cp /tmp/pyspark_py312_venv.tar.gz s3://your-bucket/code/pyspark_py312_venv.tar.gz
 ```
 
-### Spark 配置
+## emr_common.Session 使用说明
 
-`submit_job.py` 自动构建以下 spark-submit 参数传入 `emr_common.Session`：
+### 基本用法
 
+```python
+from emr_common import Session
+
+session = Session(
+    application_id="00g5qqg0spv6bq0l",
+    jobtype=1,
+    region="us-west-2",
+    job_role="arn:aws:iam::<account>:role/EMRServerlessExecutionRole",
+    logs_s3_path="s3://your-bucket/logs/",
+    script_s3_path="s3://your-bucket/code/",
+    spark_conf="--conf spark.emr-serverless.driverEnv.DATABRICKS_HOST=https://...",
+)
+
+result = session.submit_file(
+    jobname="dbx_diff",
+    local_file="/path/to/dbx_diff.py",
+    args=["--csv", "s3://bucket/tables.csv", "--s3-output", "s3://bucket/report.md"],
+)
+
+print(f"状态: {result.status}")  # SUCCESS / FAILED
 ```
-spark.archives=s3://your-bucket/code/pyspark_py312_venv.tar.gz#environment
-spark.emr-serverless.driverEnv.PYSPARK_DRIVER_PYTHON=./environment/bin/python3.12
-spark.emr-serverless.driverEnv.PYSPARK_PYTHON=./environment/bin/python3.12
-spark.executorEnv.PYSPARK_PYTHON=./environment/bin/python3.12
-spark.emr-serverless.driverEnv.LD_LIBRARY_PATH=./environment/lib
-spark.executorEnv.LD_LIBRARY_PATH=./environment/lib
-spark.emr-serverless.driverEnv.PYTHONHOME=./environment
-spark.executorEnv.PYTHONHOME=./environment
-```
+
+### submit_file 工作流程
+
+1. 将本地脚本上传至 S3（带时间戳避免覆盖）
+2. 构造 `sparkSubmit` 作业配置（合并 Application 级别配置 + spark_conf 参数）
+3. 提交作业并轮询等待完成
+4. 输出 Spark UI 链接
+5. 返回 `EMRResult(job_run_id, status)`
+
+### 注意事项
+
+- Application 级别使用 `managedPersistenceMonitoringConfiguration`（不能使用 `s3MonitoringConfiguration`，否则与 `PYTHONHOME` 冲突）
+- `spark_conf` 仅需传入运行时动态参数（如 Databricks 凭证），静态配置已在 Application 级别预设
 
 ## 性能测试
 
@@ -292,8 +272,6 @@ export NUM_TABLES=90
 
 spark-submit perf_test_setup.py
 ```
-
-每 5 张表会引入一个数据差异用于验证检测能力。
 
 ### 测试结果（90 张表）
 
