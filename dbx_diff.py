@@ -158,7 +158,7 @@ def read_emr_table(spark: SparkSession, table_name: str) -> DataFrame:
 def parse_csv(csv_path: str) -> List[Dict[str, str]]:
     """Parse input CSV file (space-delimited).
 
-    CSV columns: table_name, primary_keys (unused), pt_keys
+    CSV columns: table_name, pt_keys
     """
     if csv_path.startswith("s3://"):
         import boto3
@@ -176,7 +176,6 @@ def parse_csv(csv_path: str) -> List[Dict[str, str]]:
     for row in reader:
         rows.append({
             'table_name': (row.get('table_name') or '').strip(),
-            'primary_keys': (row.get('primary_keys') or '').strip(),
             'pt_keys': (row.get('pt_keys') or '').strip(),
         })
     if not csv_path.startswith("s3://"):

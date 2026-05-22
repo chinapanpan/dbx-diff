@@ -87,25 +87,21 @@ python3 submit_job.py \
 
 ## 输入 CSV 格式
 
-使用**空格**作为分隔符。
+使用**空格**作为分隔符，仅两列。
 
 | 列名 | 是否必填 | 说明 |
 |------|----------|------|
 | `table_name` | 是 | 全路径表名：`catalog.schema.table`（两个引擎中表名一致） |
-| `primary_keys` | 否 | 主键列，逗号分隔（如 `id,name`），当前版本保留字段 |
 | `pt_keys` | 否 | 需精细对比的具体分区值，逗号分隔（如 `20250101,20250102`） |
 
-示例（每列之间用**一个空格**分隔，空值用连续空格跳过）：
+示例：
 ```
-table_name primary_keys pt_keys
+table_name pt_keys
 workspace.demo2.test_nopk_nopart
-workspace.demo2.test_nopk_part  20250101,20250102
-workspace.demo2.test_with_pk id,name 20250101,20250102
+workspace.demo2.test_nopk_part 20250101,20250102
 ```
 
-> 注意第2行：`test_nopk_part` 与 `20250101,20250102` 之间有**两个空格**，
-> 表示 `primary_keys` 为空、`pt_keys` 为 `20250101,20250102`。
-> 若只有一个空格，则 `20250101,20250102` 会被解析为 `primary_keys` 列。
+> 非分区表或不指定特定分区时，`pt_keys` 留空即可。
 
 ## 比较规则
 
