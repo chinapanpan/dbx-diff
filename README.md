@@ -1,6 +1,6 @@
-# dbx-diff: Databricks 与 EMR 数据一致性校验工具
+# dbx-diff: Databricks 与 EMR 数据一致性校验工具 (v3)
 
-基于 PySpark 的数据对比工具，用于验证 Databricks（Delta on S3）和 EMR（Iceberg via Glue Catalog）之间的数据一致性。支持生产规模（5000+ 张表），采用高并发方式执行，通过 `emr_common.Session` 提交至 EMR Serverless 运行。
+基于 PySpark 的数据对比工具，通过聚合统计值（count、max、min、avg）比较 Databricks（Delta on S3）和 EMR（Iceberg via Glue Catalog）之间的数据一致性。采用高并发方式执行，通过 `emr_common.Session` 提交至 EMR Serverless 运行。
 
 ## 架构
 
@@ -28,6 +28,7 @@
               ┌──────┴──────┐
               │  Markdown   │
               │  报告 → S3   │
+              │  + stdout   │
               └─────────────┘
 ```
 
@@ -35,11 +36,10 @@
 
 | 文件 | 用途 |
 |------|------|
-| `dbx_diff.py` | 主比较引擎（PySpark 作业） |
+| `dbx_diff.py` | 主比较引擎（PySpark 作业），基于聚合统计值对比 |
 | `submit_job.py` | 基于 emr_common.Session 的作业提交脚本 |
 | `emr_common.py` | EMR 通用类库（管理作业提交、轮询、日志获取） |
-| `setup_test_data.py` | 功能测试数据创建（4张表，覆盖所有场景） |
-| `perf_test_setup.py` | 性能测试数据创建（批量 N 张表） |
+| `setup_test_data.py` | 功能测试数据创建（2张表，覆盖分区/非分区场景） |
 | `tables.csv` | 输入 CSV 示例 |
 
 ## 快速开始
@@ -87,55 +87,91 @@ python3 submit_job.py \
 
 ## 输入 CSV 格式
 
-使用**空格**作为分隔符（因为 `primary_keys` 列内部使用逗号分隔多个主键）。
+使用**空格**作为分隔符。
 
 | 列名 | 是否必填 | 说明 |
 |------|----------|------|
 | `table_name` | 是 | 全路径表名：`catalog.schema.table`（两个引擎中表名一致） |
-| `primary_keys` | 否 | 主键列，逗号分隔（如 `id,name`） |
-| `pt_start` | 否 | 分区范围起始值（如 `20250101`），非分区表留空 |
-| `pt_end` | 否 | 分区范围结束值（如 `20250610`），非分区表留空 |
+| `primary_keys` | 否 | 主键列，逗号分隔（如 `id,name`），当前版本保留字段 |
 | `pt_keys` | 否 | 需精细对比的具体分区值，逗号分隔（如 `20250101,20250102`） |
-| `dbx_location` | 否 | Databricks 表的 S3 路径（留空则自动通过 API 获取） |
 
 示例：
 ```
-table_name primary_keys pt_start pt_end pt_keys
-workspace.demo2.test_pk_nopart id
-workspace.demo2.test_pk_part id,name 20250101 20250103 20250101,20250102
+table_name primary_keys pt_keys
 workspace.demo2.test_nopk_nopart
-workspace.demo2.test_nopk_part  20250101 20250103 20250101,20250102
+workspace.demo2.test_nopk_part  20250101,20250102
 ```
 
 ## 比较规则
 
+### 分区检测
+
+系统通过 Databricks Unity Catalog API 批量预获取表的分区列信息。若表包含名为 `pt` 的分区列，则按分区表逻辑处理；否则按非分区表处理。
+
+### 对比逻辑
+
 | 场景 | 逻辑 |
 |------|------|
-| **有主键 + 非分区表** | 逐行对比：仅在 Databricks、仅在 EMR、值不匹配 |
-| **有主键 + 分区表** | 比较分区数量 → 各分区记录数 → 对 pt_keys 指定分区做逐行对比 |
-| **无主键 + 非分区表** | 比较总记录行数 |
-| **无主键 + 分区表** | 比较分区数量 → 各分区记录数 |
+| **非分区表** | 识别数值列（基于 Delta 表 schema），对数值列计算聚合值（count、max、min、avg），对比两侧结果 |
+| **分区表** | 识别数值列，按 `pt_keys` 过滤分区，`GROUP BY pt` 计算聚合值（count、max、min、avg），逐分区对比 |
 
-**分区检测**：系统通过 Databricks Unity Catalog API 批量预获取表的分区列信息。只有实际包含 `pt` 分区列的表才按分区表逻辑处理，即使 CSV 中填写了 `pt_start`/`pt_end`。
+### 数值列识别
+
+自动从 Delta 表 schema 中识别以下类型的列作为数值列：
+- IntegerType、LongType、ShortType、ByteType
+- FloatType、DoubleType、DecimalType
+
+### 聚合指标
+
+对每个数值列计算：
+- `count(1)` — 总行数
+- `max(col)` — 最大值
+- `min(col)` — 最小值
+- `avg(col)` — 平均值
 
 ## 输出报告
 
-Markdown 格式报告，实时追加写入，最终上传至 S3。示例：
+Markdown 格式报告，实时追加写入，完成后同时打印到 driver 日志（stdout）并上传至 S3。
+
+### 非分区表报告示例
 
 ```markdown
-### workspace.demo2.test_pk_nopart — Row Check: **FAIL**
+### workspace.demo2.test_nopk_nopart — Aggregate Check: **FAIL**
 
-| 指标 | 数量 |
-|------|------|
-| 仅在 Databricks | 1 |
-| 仅在 EMR | 0 |
-| 值不匹配 | 1 |
+- Numeric columns: `['id', 'value', 'score']`
+- Delta count: 6, Iceberg count: 5
 
-**值不匹配样例**（最多 10 条）：
+| Column | Metric | Delta Value | Iceberg Value |
+|--------|--------|-------------|---------------|
+| * | count | 6 | 5 |
+| value | max | 99.9 | 50.9 |
+| value | avg | 43.58 | 30.5 |
+```
 
-| 主键 | 列 | Databricks | EMR |
-|------|-----|------------|-----|
-| {'id': '3'} | value | 999 | 300 |
+### 分区表报告示例
+
+```markdown
+### workspace.demo2.test_nopk_part — Partitioned Aggregate Check: **FAIL**
+
+- Numeric columns: `['id', 'amount', 'score']`
+- Partitions checked: `['20250101', '20250102']`
+
+#### Partition pt=20250101 — **FAIL**
+
+- Delta count: 3, Iceberg count: 3
+
+| Column | Metric | Delta Value | Iceberg Value |
+|--------|--------|-------------|---------------|
+| amount | max | 999.0 | 200.0 |
+| amount | avg | 449.67 | 150.0 |
+
+#### Partition pt=20250102 — **FAIL**
+
+- Delta count: 4, Iceberg count: 3
+
+| Column | Metric | Delta Value | Iceberg Value |
+|--------|--------|-------------|---------------|
+| * | count | 4 | 3 |
 ```
 
 ## 认证方式
@@ -263,25 +299,3 @@ print(f"状态: {result.status}")  # SUCCESS / FAILED
 
 - Application 级别使用 `managedPersistenceMonitoringConfiguration`（不能使用 `s3MonitoringConfiguration`，否则与 `PYTHONHOME` 冲突）
 - `spark_conf` 仅需传入运行时动态参数（如 Databricks 凭证），静态配置已在 Application 级别预设
-
-## 性能测试
-
-使用 `perf_test_setup.py` 批量创建测试表：
-
-```bash
-export DATABRICKS_TOKEN="your-token"
-export NUM_TABLES=90
-
-spark-submit perf_test_setup.py
-```
-
-### 测试结果（90 张表）
-
-| 指标 | 数值 |
-|------|------|
-| 总耗时 | 324.6s |
-| 元数据预获取 | 25.7s |
-| PASS 数 | 432 |
-| FAIL 数 | 18（符合预期） |
-| 并行 workers | 15 |
-| 运行环境 | EMR Serverless 7.12 |
