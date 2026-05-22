@@ -6,7 +6,7 @@ Spark 相关配置（Iceberg catalog、venv、动态分配等）已在 EMR Serve
 
 Usage:
   python3 submit_job.py \
-    --csv s3://zpf-databricks-event/code/tables.csv \
+    --csv tables.csv \
     --s3-output s3://zpf-databricks-event/reports/diff_report.md \
     --databricks-host https://dbc-51ad87e6-c26d.cloud.databricks.com \
     --databricks-secret-arn arn:aws:secretsmanager:us-west-2:<account>:secret:<name>
@@ -15,6 +15,9 @@ Usage:
 import argparse
 import sys
 import os
+from datetime import datetime
+
+import boto3
 
 from emr_common import Session
 
@@ -24,6 +27,30 @@ EXECUTION_ROLE_ARN = "arn:aws:iam::415797100173:role/EMRServerlessExecutionRole"
 S3_LOGS_PATH = "s3://zpf-databricks-event/logs/"
 S3_SCRIPTS_PATH = "s3://zpf-databricks-event/code/"
 REGION = "us-west-2"
+
+
+def upload_csv_to_s3(local_csv: str) -> str:
+    """上传本地 CSV 到 S3，返回 S3 路径。"""
+    filename = os.path.basename(local_csv)
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    s3_bucket = S3_SCRIPTS_PATH.split("/")[2]
+    s3_key_prefix = "/".join(S3_SCRIPTS_PATH.split("/")[3:])
+    s3_key = f"{s3_key_prefix}{timestamp}_{filename}"
+
+    s3 = boto3.client("s3")
+    s3.upload_file(local_csv, s3_bucket, s3_key)
+    s3_path = f"s3://{s3_bucket}/{s3_key}"
+    print(f"已上传 CSV: {local_csv} -> {s3_path}")
+    return s3_path
+
+
+def delete_s3_file(s3_path: str):
+    """删除 S3 上的文件。"""
+    s3 = boto3.client("s3")
+    bucket = s3_path.split("/")[2]
+    key = "/".join(s3_path.split("/")[3:])
+    s3.delete_object(Bucket=bucket, Key=key)
+    print(f"已清除 S3 临时文件: {s3_path}")
 
 
 def build_spark_conf(args) -> str:
@@ -41,10 +68,10 @@ def build_spark_conf(args) -> str:
     return " ".join(confs)
 
 
-def build_job_args(args) -> list:
+def build_job_args(args, s3_csv: str) -> list:
     """构建 dbx_diff.py 的入口参数。"""
     job_args = [
-        "--csv", args.csv,
+        "--csv", s3_csv,
         "--s3-output", args.s3_output,
         "--workers", str(args.workers),
         "--timeout", str(args.timeout),
@@ -59,7 +86,7 @@ def build_job_args(args) -> list:
 
 def main():
     parser = argparse.ArgumentParser(description="提交 dbx_diff 数据对比作业")
-    parser.add_argument("--csv", required=True, help="输入 CSV 路径（S3 路径）")
+    parser.add_argument("--csv", required=True, help="输入 CSV 路径（本地文件）")
     parser.add_argument("--s3-output", required=True, help="S3 报告输出路径")
     parser.add_argument("--databricks-host", required=True, help="Databricks workspace URL")
     parser.add_argument("--databricks-secret-arn", default=None,
@@ -74,6 +101,9 @@ def main():
                         help="EMR Serverless 执行角色 ARN")
     args = parser.parse_args()
 
+    # 上传本地 CSV 到 S3
+    s3_csv = upload_csv_to_s3(args.csv)
+
     session = Session(
         application_id=args.application_id,
         jobtype=1,
@@ -85,14 +115,17 @@ def main():
     )
 
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dbx_diff.py")
-    job_args = build_job_args(args)
+    job_args = build_job_args(args, s3_csv)
 
     print(f"应用 ID: {args.application_id}")
-    print(f"输入 CSV: {args.csv}")
+    print(f"输入 CSV: {args.csv} -> {s3_csv}")
     print(f"输出报告: {args.s3_output}")
     print(f"认证方式: {'OAuth2 (secret-arn)' if args.databricks_secret_arn else 'Token'}")
 
     result = session.submit_file("dbx_diff", script_path, args=job_args)
+
+    # 清除 S3 上的临时 CSV
+    delete_s3_file(s3_csv)
 
     if result.status in ("SUCCESS", "COMPLETED"):
         print(f"\n作业成功完成。报告路径: {args.s3_output}")

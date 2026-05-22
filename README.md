@@ -55,17 +55,19 @@
 
 ```bash
 python3 submit_job.py \
-  --csv s3://your-bucket/code/tables.csv \
+  --csv tables.csv \
   --s3-output s3://your-bucket/reports/diff_report.md \
   --databricks-host https://your-workspace.cloud.databricks.com \
   --databricks-secret-arn arn:aws:secretsmanager:us-west-2:<account>:secret:<name>
 ```
 
-`submit_job.py` 内部通过 `emr_common.Session` 完成以下流程：
-1. 自动将 `dbx_diff.py` 上传至 S3
-2. 传入运行时环境变量（Databricks 凭证）
-3. 调用 `session.submit_file()` 提交作业
-4. 轮询等待完成，输出 Spark UI 链接
+`--csv` 传入本地文件路径。`submit_job.py` 内部通过 `emr_common.Session` 完成以下流程：
+1. 上传本地 CSV 至 S3（带时间戳）
+2. 自动将 `dbx_diff.py` 上传至 S3
+3. 传入运行时环境变量（Databricks 凭证）
+4. 调用 `session.submit_file()` 提交作业
+5. 轮询等待完成，输出 Spark UI 链接
+6. 清除 S3 上的临时 CSV 文件
 
 > Spark 基础配置（Iceberg catalog、Python venv、动态分配等）已在 EMR Serverless Application 级别预配置，`submit_job.py` 仅传入业务参数。
 
@@ -73,7 +75,7 @@ python3 submit_job.py \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--csv` | （必填） | 输入 CSV 路径（S3 路径） |
+| `--csv` | （必填） | 输入 CSV 本地文件路径 |
 | `--s3-output` | （必填） | S3 输出报告路径 |
 | `--databricks-host` | （必填） | Databricks workspace URL |
 | `--databricks-secret-arn` | 无 | AWS Secrets Manager ARN（OAuth2 认证，推荐） |
