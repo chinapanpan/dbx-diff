@@ -511,9 +511,20 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str,
         numeric_cols = identify_numeric_columns(df_dbx)
 
         if not numeric_cols:
+            if is_partitioned and pt_start and pt_end:
+                pt_end_plus1 = str(int(pt_end) + 1)
+                sql = (f"SELECT pt, count(1) AS total_count\n"
+                       f"FROM {table_name}\n"
+                       f"WHERE pt >= '{pt_start}' AND pt < '{pt_end_plus1}'\n"
+                       f"GROUP BY pt\nORDER BY pt")
+            elif is_partitioned:
+                sql = f"SELECT pt, count(1) AS total_count\nFROM {table_name}\nGROUP BY pt\nORDER BY pt"
+            else:
+                sql = f"SELECT count(1) AS total_count\nFROM {table_name}"
             dbx_count = df_dbx.count()
             emr_count = df_emr.count()
             result_md = f"\n### {table_name} — Count Only (no numeric columns)\n\n"
+            result_md += f"**SQL:**\n```sql\n{sql}\n```\n\n"
             result_md += f"| Side | Count |\n|------|-------|\n"
             result_md += f"| Delta | {dbx_count} |\n"
             result_md += f"| Iceberg | {emr_count} |\n"
