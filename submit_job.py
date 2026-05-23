@@ -9,7 +9,9 @@ Usage:
     --csv tables.csv \
     --s3-output s3://zpf-databricks-event/reports/diff_report.md \
     --databricks-host https://dbc-51ad87e6-c26d.cloud.databricks.com \
-    --databricks-secret-arn arn:aws:secretsmanager:us-west-2:<account>:secret:<name>
+    --databricks-secret-arn arn:aws:secretsmanager:us-west-2:<account>:secret:<name> \
+    --pt-start 20260521 \
+    --pt-end 20260522
 """
 
 import argparse
@@ -22,8 +24,8 @@ import boto3
 from emr_common import Session
 
 
-EMR_SERVERLESS_APP_ID = "00g5qqg0spv6bq0l"
-EXECUTION_ROLE_ARN = "arn:aws:iam::415797100173:role/EMRServerlessExecutionRole"
+EMR_SERVERLESS_APP_ID = "00g5t48pdtcnid0l"
+EXECUTION_ROLE_ARN = "arn:aws:iam::785682719467:role/EMRServerlessExecutionRole"
 S3_LOGS_PATH = "s3://zpf-databricks-event/logs/"
 S3_SCRIPTS_PATH = "s3://zpf-databricks-event/code/"
 REGION = "us-west-2"
@@ -58,13 +60,6 @@ def build_spark_conf(args) -> str:
     confs = [
         f"--conf spark.emr-serverless.driverEnv.DATABRICKS_HOST={args.databricks_host}",
     ]
-    if args.databricks_secret_arn:
-        pass
-    elif args.databricks_token:
-        confs.extend([
-            f"--conf spark.emr-serverless.driverEnv.DATABRICKS_TOKEN={args.databricks_token}",
-            f"--conf spark.executorEnv.DATABRICKS_TOKEN={args.databricks_token}",
-        ])
     return " ".join(confs)
 
 
@@ -76,11 +71,12 @@ def build_job_args(args, s3_csv: str) -> list:
         "--workers", str(args.workers),
         "--timeout", str(args.timeout),
         "--databricks-host", args.databricks_host,
+        "--databricks-secret-arn", args.databricks_secret_arn,
     ]
-    if args.databricks_secret_arn:
-        job_args.extend(["--databricks-secret-arn", args.databricks_secret_arn])
-    elif args.databricks_token:
-        job_args.extend(["--databricks-token", args.databricks_token])
+    if args.pt_start:
+        job_args.extend(["--pt-start", args.pt_start])
+    if args.pt_end:
+        job_args.extend(["--pt-end", args.pt_end])
     return job_args
 
 
@@ -89,10 +85,10 @@ def main():
     parser.add_argument("--csv", required=True, help="输入 CSV 路径（本地文件）")
     parser.add_argument("--s3-output", required=True, help="S3 报告输出路径")
     parser.add_argument("--databricks-host", required=True, help="Databricks workspace URL")
-    parser.add_argument("--databricks-secret-arn", default=None,
-                        help="AWS Secrets Manager ARN（OAuth2 认证，推荐）")
-    parser.add_argument("--databricks-token", default=None,
-                        help="Databricks PAT（备选，secret-arn 优先）")
+    parser.add_argument("--databricks-secret-arn", required=True,
+                        help="AWS Secrets Manager ARN（OAuth2 认证）")
+    parser.add_argument("--pt-start", default=None, help="分区起始值（含），如 20260521")
+    parser.add_argument("--pt-end", default=None, help="分区结束值（含，过滤时用 < end+1），如 20260522")
     parser.add_argument("--workers", type=int, default=15, help="并行 worker 数（默认 15）")
     parser.add_argument("--timeout", type=int, default=600, help="单表超时秒数（默认 600）")
     parser.add_argument("--application-id", default=EMR_SERVERLESS_APP_ID,
@@ -101,7 +97,6 @@ def main():
                         help="EMR Serverless 执行角色 ARN")
     args = parser.parse_args()
 
-    # 上传本地 CSV 到 S3
     s3_csv = upload_csv_to_s3(args.csv)
 
     session = Session(
@@ -120,11 +115,12 @@ def main():
     print(f"应用 ID: {args.application_id}")
     print(f"输入 CSV: {args.csv} -> {s3_csv}")
     print(f"输出报告: {args.s3_output}")
-    print(f"认证方式: {'OAuth2 (secret-arn)' if args.databricks_secret_arn else 'Token'}")
+    print(f"认证方式: OAuth2 (secret-arn)")
+    if args.pt_start and args.pt_end:
+        print(f"分区范围: pt >= {args.pt_start} AND pt < {int(args.pt_end) + 1}")
 
     result = session.submit_file("dbx_diff", script_path, args=job_args)
 
-    # 清除 S3 上的临时 CSV
     delete_s3_file(s3_csv)
 
     if result.status in ("SUCCESS", "COMPLETED"):

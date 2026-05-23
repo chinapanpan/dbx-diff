@@ -1,3 +1,4 @@
-table_name pt_keys
+table_name
 workspace.demo2.test_nopk_nopart
-workspace.demo2.test_nopk_part 20250101,20250102
+workspace.demo2.test_nopk_part
+workspace.demo2.test_all_match

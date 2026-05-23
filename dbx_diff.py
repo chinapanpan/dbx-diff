@@ -1,7 +1,7 @@
 """
-Databricks vs EMR Data Comparison Tool (v3 - Aggregate Based).
+Databricks vs EMR Data Comparison Tool (v4 - Aggregate Based).
 
-Compares numeric column aggregates (count, sum, max, min, avg) between
+Compares numeric column aggregates (count, sum, max, min) between
 Databricks (Delta on S3) and EMR (Iceberg via Glue catalog).
 """
 
@@ -60,17 +60,19 @@ def get_spark() -> SparkSession:
         .getOrCreate()
 
 
-def get_secret_from_sm(secret_arn: str, region: str = "us-west-2") -> Tuple[str, str]:
-    """Retrieve client_id:client_secret from AWS Secrets Manager."""
+def get_secret_from_sm(secret_arn: str, region: str = "us-west-2") -> str:
+    """Retrieve secret value from AWS Secrets Manager.
+
+    Supports two formats:
+    - client_id:client_secret (OAuth2)
+    - plain token (PAT)
+    """
     import boto3
     client = boto3.client("secretsmanager", region_name=region)
     resp = client.get_secret_value(SecretId=secret_arn)
     secret_str = resp["SecretString"].strip()
-    parts = secret_str.split(":", 1)
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise ValueError(f"Secret {secret_arn} must be plaintext format: client_id:client_secret")
-    print(f"Retrieved OAuth2 credentials from Secrets Manager: {secret_arn}")
-    return parts[0], parts[1]
+    print(f"Retrieved credentials from Secrets Manager: {secret_arn}")
+    return secret_str
 
 
 def get_oauth2_token(host: str, client_id: str, client_secret: str) -> str:
@@ -142,10 +144,7 @@ def read_emr_table(spark: SparkSession, table_name: str) -> DataFrame:
 
 
 def parse_csv(csv_path: str) -> List[Dict[str, str]]:
-    """Parse input CSV file (space-delimited).
-
-    CSV columns: table_name, pt_keys
-    """
+    """Parse input CSV file. Single column: table_name."""
     if csv_path.startswith("s3://"):
         import boto3
         s3 = boto3.client("s3")
@@ -158,12 +157,11 @@ def parse_csv(csv_path: str) -> List[Dict[str, str]]:
         f = open(csv_path, 'r')
 
     rows = []
-    reader = csv.DictReader(f, delimiter=' ')
-    for row in reader:
-        rows.append({
-            'table_name': (row.get('table_name') or '').strip(),
-            'pt_keys': (row.get('pt_keys') or '').strip(),
-        })
+    for line in f:
+        line = line.strip()
+        if not line or line.startswith("table_name"):
+            continue
+        rows.append({'table_name': line.strip()})
     if not csv_path.startswith("s3://"):
         f.close()
     return rows
@@ -204,46 +202,44 @@ def get_column_types(df: DataFrame, numeric_cols: List[str]) -> Dict[str, str]:
     return type_map
 
 
-def build_agg_sql(table_name: str, numeric_cols: List[str], pt_keys: List[str] = None) -> str:
+def build_agg_sql(table_name: str, numeric_cols: List[str], pt_start: str = None, pt_end: str = None) -> str:
     """Build the SQL string for aggregate comparison (for reporting purposes)."""
     agg_parts = ["count(1) AS total_count"]
     for col_name in numeric_cols:
         agg_parts.append(f"sum({col_name}) AS {col_name}_sum")
         agg_parts.append(f"max({col_name}) AS {col_name}_max")
         agg_parts.append(f"min({col_name}) AS {col_name}_min")
-        agg_parts.append(f"avg({col_name}) AS {col_name}_avg")
     select_clause = ",\n       ".join(agg_parts)
 
-    if pt_keys:
-        pt_list = ", ".join(f"'{p}'" for p in pt_keys)
+    if pt_start and pt_end:
+        pt_end_plus1 = str(int(pt_end) + 1)
         return (f"SELECT pt,\n       {select_clause}\n"
                 f"FROM {table_name}\n"
-                f"WHERE pt IN ({pt_list})\n"
+                f"WHERE pt >= '{pt_start}' AND pt < '{pt_end_plus1}'\n"
                 f"GROUP BY pt\nORDER BY pt")
     else:
         return f"SELECT {select_clause}\nFROM {table_name}"
 
 
 def compute_aggregates(df: DataFrame, numeric_cols: List[str]) -> DataFrame:
-    """Compute count, sum, max, min, avg for each numeric column on a DataFrame."""
+    """Compute count, sum, max, min for each numeric column on a DataFrame."""
     agg_exprs = [F.count(F.lit(1)).alias("total_count")]
     for col_name in numeric_cols:
         agg_exprs.append(F.sum(F.col(col_name)).alias(f"{col_name}_sum"))
         agg_exprs.append(F.max(F.col(col_name)).alias(f"{col_name}_max"))
         agg_exprs.append(F.min(F.col(col_name)).alias(f"{col_name}_min"))
-        agg_exprs.append(F.avg(F.col(col_name)).alias(f"{col_name}_avg"))
     return df.agg(*agg_exprs)
 
 
-def compute_aggregates_by_partition(df: DataFrame, numeric_cols: List[str], pt_keys: List[str]) -> DataFrame:
-    """Compute count, sum, max, min, avg for each numeric column grouped by pt partition."""
-    df_filtered = df.filter(F.col("pt").isin(pt_keys))
+def compute_aggregates_by_partition(df: DataFrame, numeric_cols: List[str], pt_start: str, pt_end: str) -> DataFrame:
+    """Compute count, sum, max, min for each numeric column grouped by pt partition."""
+    pt_end_plus1 = str(int(pt_end) + 1)
+    df_filtered = df.filter((F.col("pt") >= pt_start) & (F.col("pt") < pt_end_plus1))
     agg_exprs = [F.count(F.lit(1)).alias("total_count")]
     for col_name in numeric_cols:
         agg_exprs.append(F.sum(F.col(col_name)).alias(f"{col_name}_sum"))
         agg_exprs.append(F.max(F.col(col_name)).alias(f"{col_name}_max"))
         agg_exprs.append(F.min(F.col(col_name)).alias(f"{col_name}_min"))
-        agg_exprs.append(F.avg(F.col(col_name)).alias(f"{col_name}_avg"))
     return df_filtered.groupBy("pt").agg(*agg_exprs).orderBy("pt")
 
 
@@ -267,14 +263,11 @@ def compare_aggregates_non_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
         all_match = False
 
     for col_name in numeric_cols:
-        for metric in ["sum", "max", "min", "avg"]:
+        for metric in ["sum", "max", "min"]:
             key = f"{col_name}_{metric}"
             dbx_val = dbx_agg.get(key)
             emr_val = emr_agg.get(key)
             if dbx_val != emr_val:
-                if metric == "avg" and dbx_val is not None and emr_val is not None:
-                    if abs(float(dbx_val) - float(emr_val)) < 1e-6:
-                        continue
                 diffs.append({
                     "column": col_name,
                     "metric": metric,
@@ -302,11 +295,11 @@ def compare_aggregates_non_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
 
 def compare_aggregates_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
                                     numeric_cols: List[str], col_types: Dict[str, str],
-                                    pt_keys: List[str],
+                                    pt_start: str, pt_end: str,
                                     table_name: str) -> Dict:
     """Compare aggregate stats for a partitioned table, grouped by pt."""
-    dbx_agg_df = compute_aggregates_by_partition(df_dbx, numeric_cols, pt_keys)
-    emr_agg_df = compute_aggregates_by_partition(df_emr, numeric_cols, pt_keys)
+    dbx_agg_df = compute_aggregates_by_partition(df_dbx, numeric_cols, pt_start, pt_end)
+    emr_agg_df = compute_aggregates_by_partition(df_emr, numeric_cols, pt_start, pt_end)
 
     dbx_rows = {row["pt"]: row.asDict() for row in dbx_agg_df.collect()}
     emr_rows = {row["pt"]: row.asDict() for row in emr_agg_df.collect()}
@@ -337,14 +330,11 @@ def compare_aggregates_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
                 all_match = False
 
             for col_name in numeric_cols:
-                for metric in ["sum", "max", "min", "avg"]:
+                for metric in ["sum", "max", "min"]:
                     key = f"{col_name}_{metric}"
                     dbx_val = dbx_data.get(key)
                     emr_val = emr_data.get(key)
                     if dbx_val != emr_val:
-                        if metric == "avg" and dbx_val is not None and emr_val is not None:
-                            if abs(float(dbx_val) - float(emr_val)) < 1e-6:
-                                continue
                         pt_diffs.append({
                             "column": col_name,
                             "metric": metric,
@@ -363,12 +353,13 @@ def compare_aggregates_partitioned(df_dbx: DataFrame, df_emr: DataFrame,
             "match": len(pt_diffs) == 0,
         })
 
-    sql = build_agg_sql(table_name, numeric_cols, pt_keys)
+    sql = build_agg_sql(table_name, numeric_cols, pt_start, pt_end)
 
     return {
         "table": table_name,
         "partitioned": True,
-        "pt_keys": pt_keys,
+        "pt_start": pt_start,
+        "pt_end": pt_end,
         "numeric_cols": numeric_cols,
         "col_types": col_types,
         "sql": sql,
@@ -382,14 +373,11 @@ def format_non_partitioned_result_md(result: Dict) -> str:
     status = "PASS" if result['match'] else "FAIL"
     md = f"\n### {result['table']} — Aggregate Check: **{status}**\n\n"
 
-    # SQL
     md += f"**SQL:**\n```sql\n{result['sql']}\n```\n\n"
 
-    # Full results from both engines
     numeric_cols = result['numeric_cols']
     dbx_agg = result['dbx_agg']
     emr_agg = result['emr_agg']
-
     col_types = result.get('col_types', {})
 
     md += "**Results:**\n\n"
@@ -399,16 +387,13 @@ def format_non_partitioned_result_md(result: Dict) -> str:
     md += f"| * | - | count | {dbx_agg['total_count']} | {emr_agg['total_count']} | {'Y' if count_match else 'N'} |\n"
     for col_name in numeric_cols:
         col_type = col_types.get(col_name, "")
-        for metric in ["sum", "max", "min", "avg"]:
+        for metric in ["sum", "max", "min"]:
             key = f"{col_name}_{metric}"
             dbx_val = dbx_agg.get(key)
             emr_val = emr_agg.get(key)
             match = dbx_val == emr_val
-            if metric == "avg" and dbx_val is not None and emr_val is not None:
-                match = abs(float(dbx_val) - float(emr_val)) < 1e-6
             md += f"| {col_name} | {col_type} | {metric} | {dbx_val} | {emr_val} | {'Y' if match else 'N'} |\n"
 
-    # Conclusion
     md += f"\n**Conclusion: {status}**\n"
     if not result['match']:
         md += "\nDifferences:\n"
@@ -423,7 +408,6 @@ def format_partitioned_result_md(result: Dict) -> str:
     status = "PASS" if result['match'] else "FAIL"
     md = f"\n### {result['table']} — Partitioned Aggregate Check: **{status}**\n\n"
 
-    # SQL
     md += f"**SQL:**\n```sql\n{result['sql']}\n```\n\n"
 
     numeric_cols = result['numeric_cols']
@@ -444,13 +428,11 @@ def format_partitioned_result_md(result: Dict) -> str:
         md += f"| * | - | count | {dbx_count} | {emr_count} | {'Y' if count_match else 'N'} |\n"
         for col_name in numeric_cols:
             col_type = col_types.get(col_name, "")
-            for metric in ["sum", "max", "min", "avg"]:
+            for metric in ["sum", "max", "min"]:
                 key = f"{col_name}_{metric}"
                 dbx_val = dbx_data.get(key)
                 emr_val = emr_data.get(key)
                 match = dbx_val == emr_val
-                if metric == "avg" and dbx_val is not None and emr_val is not None:
-                    match = abs(float(dbx_val) - float(emr_val)) < 1e-6
                 md += f"| {col_name} | {col_type} | {metric} | {dbx_val} | {emr_val} | {'Y' if match else 'N'} |\n"
 
         if pr['diffs']:
@@ -463,17 +445,46 @@ def format_partitioned_result_md(result: Dict) -> str:
     return md
 
 
+def format_summary_section(results: List[Dict]) -> str:
+    """Generate a summary section for tables with differences."""
+    failed_tables = [r for r in results if not r.get("match", True)]
+    if not failed_tables:
+        return "\n## Difference Summary\n\nAll tables PASS - no differences found.\n\n"
+
+    md = "\n## Difference Summary\n\n"
+    md += f"Tables with differences: **{len(failed_tables)}** / {len(results)}\n\n"
+    md += "| # | Table | Status | Difference Reason |\n"
+    md += "|---|-------|--------|-------------------|\n"
+
+    for i, r in enumerate(failed_tables, 1):
+        table_name = r.get("table", "unknown")
+        if r.get("error"):
+            reason = f"ERROR: {r['error']}"
+        elif not r.get("partitioned", False):
+            reasons = []
+            for diff in r.get("diffs", []):
+                reasons.append(f"`{diff['column']}`.{diff['metric']}: Delta={diff['delta_value']} vs Iceberg={diff['iceberg_value']}")
+            reason = "; ".join(reasons) if reasons else "Unknown"
+        else:
+            reasons = []
+            for pr in r.get("partition_results", []):
+                if not pr.get("match", True):
+                    for diff in pr.get("diffs", []):
+                        reasons.append(f"pt={pr['pt']}: `{diff['column']}`.{diff['metric']}: Delta={diff['delta_value']} vs Iceberg={diff['iceberg_value']}")
+            reason = "; ".join(reasons) if reasons else "Unknown"
+        md += f"| {i} | {table_name} | FAIL | {reason} |\n"
+
+    md += "\n"
+    return md
+
+
 def compare_single_table(spark: SparkSession, config: Dict, report_path: str,
-                         table_metadata: Dict = None):
+                         table_metadata: Dict = None, pt_start: str = None, pt_end: str = None) -> Dict:
     """Compare a single table between Databricks (Delta) and EMR (Iceberg).
 
-    Logic:
-    - Determine if partitioned by checking if 'pt' is in partition_cols (from Delta metadata)
-    - Non-partitioned: compute count, sum, max, min, avg on numeric columns for both sides
-    - Partitioned: filter by pt_keys, group by pt, compute count, sum, max, min, avg
+    Returns a result dict with match status and details.
     """
     table_name = config['table_name']
-    pt_keys = [k.strip() for k in config['pt_keys'].split(',') if k.strip()] if config['pt_keys'] else []
 
     meta = table_metadata or {}
     part_cols = meta.get("partition_cols", [])
@@ -482,8 +493,8 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str,
     start_time = time.time()
     md_content = f"\n---\n## Table: `{table_name}`\n"
     md_content += f"- Partitioned: {'Yes (pt)' if is_partitioned else 'No'}\n"
-    if is_partitioned and pt_keys:
-        md_content += f"- pt_keys: `{pt_keys}`\n"
+    if is_partitioned and pt_start and pt_end:
+        md_content += f"- Partition range: pt >= {pt_start} AND pt < {int(pt_end) + 1}\n"
     md_content += f"- Started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     append_md(report_path, md_content)
 
@@ -497,40 +508,50 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str,
         df_dbx = read_delta_table(spark, dbx_location)
         df_emr = read_emr_table(spark, table_name)
 
-        # Identify numeric columns from Delta table schema
         numeric_cols = identify_numeric_columns(df_dbx)
 
         if not numeric_cols:
-            # No numeric columns — just compare count
             dbx_count = df_dbx.count()
             emr_count = df_emr.count()
             result_md = f"\n### {table_name} — Count Only (no numeric columns)\n\n"
             result_md += f"| Side | Count |\n|------|-------|\n"
             result_md += f"| Delta | {dbx_count} |\n"
             result_md += f"| Iceberg | {emr_count} |\n"
-            if dbx_count != emr_count:
+            match = dbx_count == emr_count
+            if not match:
                 result_md += f"\n> **FAIL** — Difference: {dbx_count - emr_count:+d}\n"
             else:
                 result_md += f"\n> **PASS**\n"
             append_md(report_path, result_md)
+            elapsed = time.time() - start_time
+            append_md(report_path, f"\n> Completed in {elapsed:.1f}s\n")
+            return {"table": table_name, "match": match, "partitioned": False, "diffs": []}
         elif not is_partitioned:
-            # Non-partitioned: full aggregate comparison
             col_types = get_column_types(df_dbx, numeric_cols)
             result = compare_aggregates_non_partitioned(df_dbx, df_emr, numeric_cols, col_types, table_name)
             append_md(report_path, format_non_partitioned_result_md(result))
         else:
-            # Partitioned: aggregate by pt
             col_types = get_column_types(df_dbx, numeric_cols)
-            if not pt_keys:
+            if not pt_start or not pt_end:
                 dbx_pts = [row["pt"] for row in df_dbx.select("pt").distinct().collect()]
                 emr_pts = [row["pt"] for row in df_emr.select("pt").distinct().collect()]
-                pt_keys = sorted(set(dbx_pts + emr_pts))
+                all_pts = sorted(set(dbx_pts + emr_pts))
+                if all_pts:
+                    pt_start = pt_start or all_pts[0]
+                    pt_end = pt_end or all_pts[-1]
+                else:
+                    result = {"table": table_name, "match": True, "partitioned": True, "partition_results": []}
+                    append_md(report_path, f"\n### {table_name} — No partitions found\n")
+                    elapsed = time.time() - start_time
+                    append_md(report_path, f"\n> Completed in {elapsed:.1f}s\n")
+                    return result
 
-            result = compare_aggregates_partitioned(df_dbx, df_emr, numeric_cols, col_types, pt_keys, table_name)
+            result = compare_aggregates_partitioned(df_dbx, df_emr, numeric_cols, col_types, pt_start, pt_end, table_name)
             append_md(report_path, format_partitioned_result_md(result))
 
         elapsed = time.time() - start_time
         append_md(report_path, f"\n> Completed in {elapsed:.1f}s\n")
+        return result
 
     except Exception as e:
         elapsed = time.time() - start_time
@@ -539,11 +560,48 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str,
         error_md += f"\n> Failed after {elapsed:.1f}s\n"
         append_md(report_path, error_md)
         print(f"ERROR processing {table_name}: {e}", file=sys.stderr)
+        return {"table": table_name, "match": False, "error": str(e)}
+
+
+def compare_tables(spark: SparkSession, configs: List[Dict], all_metadata: Dict[str, Dict],
+                   report_path: str, workers: int, timeout: int,
+                   pt_start: str = None, pt_end: str = None) -> List[Dict]:
+    """Main comparison logic: compare all tables in parallel and collect results."""
+    results = []
+    total_start = time.time()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        for config in configs:
+            table_meta = all_metadata.get(config['table_name'], {})
+            future = executor.submit(compare_single_table, spark, config, report_path,
+                                     table_meta, pt_start, pt_end)
+            futures[future] = config['table_name']
+
+        for future in as_completed(futures):
+            table = futures[future]
+            try:
+                result = future.result(timeout=timeout)
+                results.append(result)
+                print(f"DONE: {table}")
+            except Exception as e:
+                print(f"TIMEOUT/ERROR: {table}: {e}", file=sys.stderr)
+                error_md = f"\n---\n## Table: `{table}` — **TIMEOUT**\n\n```\n{str(e)}\n```\n"
+                append_md(report_path, error_md)
+                results.append({"table": table, "match": False, "error": str(e)})
+
+    total_elapsed = time.time() - total_start
+    summary_time = f"\n---\n## Execution Summary\n\n"
+    summary_time += f"- Total tables: {len(configs)}\n"
+    summary_time += f"- Comparison time: {total_elapsed:.1f}s\n"
+    append_md(report_path, summary_time)
+
+    return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Databricks vs EMR Data Diff Tool (v3 - Aggregate)")
-    parser.add_argument("--csv", required=True, help="Path to input CSV file (space-delimited)")
+    parser = argparse.ArgumentParser(description="Databricks vs EMR Data Diff Tool (v4 - Aggregate)")
+    parser.add_argument("--csv", required=True, help="Path to input CSV file (one table_name per line)")
     parser.add_argument("--s3-output", required=True, help="S3 path for output report")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"Max parallel workers (default: {MAX_WORKERS})")
     parser.add_argument("--timeout", type=int, default=TIMEOUT_PER_TABLE, help=f"Timeout per table in seconds (default: {TIMEOUT_PER_TABLE})")
@@ -551,6 +609,8 @@ def main():
     parser.add_argument("--databricks-token", default=None, help="Databricks access token")
     parser.add_argument("--databricks-secret-arn", default=None, help="AWS Secrets Manager ARN for OAuth2")
     parser.add_argument("--region", default="us-west-2", help="AWS region for Secrets Manager")
+    parser.add_argument("--pt-start", default=None, help="Partition start value (inclusive), e.g. 20260521")
+    parser.add_argument("--pt-end", default=None, help="Partition end value (inclusive in input, filter uses < end+1), e.g. 20260522")
     args = parser.parse_args()
 
     global DATABRICKS_HOST, DATABRICKS_TOKEN
@@ -561,8 +621,13 @@ def main():
         if not DATABRICKS_HOST:
             print("ERROR: --databricks-host is required when using --databricks-secret-arn", file=sys.stderr)
             sys.exit(1)
-        client_id, client_secret = get_secret_from_sm(args.databricks_secret_arn, args.region)
-        DATABRICKS_TOKEN = get_oauth2_token(DATABRICKS_HOST, client_id, client_secret)
+        secret_value = get_secret_from_sm(args.databricks_secret_arn, args.region)
+        if ":" in secret_value and not secret_value.startswith("dapi"):
+            client_id, client_secret = secret_value.split(":", 1)
+            DATABRICKS_TOKEN = get_oauth2_token(DATABRICKS_HOST, client_id, client_secret)
+        else:
+            DATABRICKS_TOKEN = secret_value
+            print("Using PAT token from Secrets Manager")
     elif args.databricks_token:
         DATABRICKS_TOKEN = args.databricks_token
 
@@ -581,47 +646,35 @@ def main():
     print(f"Metadata pre-fetch took {prefetch_elapsed:.1f}s")
 
     report_path = tempfile.mktemp(suffix=".md")
-    header = f"# Databricks vs EMR Data Diff Report (v3 - Aggregate)\n\n"
+    header = f"# Databricks vs EMR Data Diff Report (v4 - Aggregate)\n\n"
     header += f"- Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     header += f"- Tables: {len(configs)}\n"
     header += f"- Workers: {args.workers}\n"
+    if args.pt_start and args.pt_end:
+        header += f"- Partition filter: pt >= {args.pt_start} AND pt < {int(args.pt_end) + 1}\n"
     header += f"- Metadata pre-fetch: {prefetch_elapsed:.1f}s\n\n"
     with open(report_path, 'w') as f:
         f.write(header)
 
-    total_start = time.time()
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {}
-        for config in configs:
-            table_meta = all_metadata.get(config['table_name'], {})
-            future = executor.submit(compare_single_table, spark, config, report_path, table_meta)
-            futures[future] = config['table_name']
+    results = compare_tables(spark, configs, all_metadata, report_path,
+                             args.workers, args.timeout, args.pt_start, args.pt_end)
 
-        for future in as_completed(futures):
-            table = futures[future]
-            try:
-                future.result(timeout=args.timeout)
-                print(f"DONE: {table}")
-            except Exception as e:
-                print(f"TIMEOUT/ERROR: {table}: {e}", file=sys.stderr)
-                error_md = f"\n---\n## Table: `{table}` — **TIMEOUT**\n\n```\n{str(e)}\n```\n"
-                append_md(report_path, error_md)
-
-    total_elapsed = time.time() - total_start
-    summary = f"\n---\n## Summary\n\n"
-    summary += f"- Total tables: {len(configs)}\n"
-    summary += f"- Metadata pre-fetch: {prefetch_elapsed:.1f}s\n"
-    summary += f"- Comparison time: {total_elapsed:.1f}s\n"
-    summary += f"- Total time: {prefetch_elapsed + total_elapsed:.1f}s\n"
-    append_md(report_path, summary)
-
-    # Print report to driver log (stdout)
+    summary_section = format_summary_section(results)
     with open(report_path, 'r') as f:
-        report_content = f.read()
+        existing_content = f.read()
+    header_end = existing_content.find("\n---\n")
+    if header_end == -1:
+        final_content = existing_content + summary_section
+    else:
+        final_content = existing_content[:header_end] + summary_section + existing_content[header_end:]
+    with open(report_path, 'w') as f:
+        f.write(final_content)
+
     print("\n" + "=" * 80)
     print("REPORT OUTPUT:")
     print("=" * 80)
-    print(report_content)
+    with open(report_path, 'r') as f:
+        print(f.read())
     print("=" * 80 + "\n")
 
     upload_to_s3(report_path, args.s3_output)

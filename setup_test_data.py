@@ -1,10 +1,11 @@
 """
 Set up test data in Databricks (workspace.demo2) and EMR (Iceberg catalog)
-for aggregate-based comparison testing (v3).
+for aggregate-based comparison testing (v4).
 
 Test tables:
 1. test_nopk_nopart — non-partitioned, numeric columns (aggregate diff)
 2. test_nopk_part  — partitioned by pt, numeric columns (per-partition aggregate diff)
+3. test_all_match  — partitioned by pt, all data matches (PASS case)
 """
 
 import sys
@@ -18,9 +19,9 @@ DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 DBX_CATALOG = "workspace"
 DBX_SCHEMA = "demo2"
 
-EMR_CATALOG = "iceberg_catalog"
+EMR_CATALOG = "workspace"
 EMR_DB = "demo2"
-EMR_WAREHOUSE = "s3://zpf-databricks-event/emr/demo2"
+EMR_WAREHOUSE = "s3://zpf-databricks-event/emr/warehouse"
 
 
 def dbx_sql(sql: str, wait: bool = True) -> dict:
@@ -80,9 +81,7 @@ def setup_databricks_tables():
         (4, 'david', 40.1, 70),
         (5, 'eve', 50.9, 95)
     """)
-    # Introduce difference: modify one row's value (will change max/avg)
     dbx_sql("UPDATE test_nopk_nopart SET value = 99.9 WHERE id = 5")
-    # Add extra row (will change count)
     dbx_sql("INSERT INTO test_nopk_nopart VALUES (6, 'frank', 60.0, 88)")
     print("  Created test_nopk_nopart (6 rows, value[5] modified, extra row)")
 
@@ -102,11 +101,25 @@ def setup_databricks_tables():
         (5, 'eve', 250.0, 95, '20250102'),
         (6, 'frank', 180.0, 88, '20250102')
     """)
-    # Introduce difference in pt=20250101: change amount for one row
     dbx_sql("UPDATE test_nopk_part SET amount = 999.0 WHERE id = 1 AND pt = '20250101'")
-    # Add extra row in pt=20250102 (will change count for that partition)
     dbx_sql("INSERT INTO test_nopk_part VALUES (7, 'grace', 400.0, 92, '20250102')")
     print("  Created test_nopk_part (pt=20250101: amount[1] modified; pt=20250102: extra row)")
+
+    # 3. test_all_match — partitioned by pt, identical data both sides
+    dbx_sql("DROP TABLE IF EXISTS test_all_match")
+    dbx_sql("""
+        CREATE TABLE test_all_match (
+            id INT, name STRING, amount DOUBLE, score INT, pt STRING
+        ) USING DELTA PARTITIONED BY (pt)
+    """)
+    dbx_sql("""
+        INSERT INTO test_all_match VALUES
+        (1, 'alice', 100.0, 80, '20250101'),
+        (2, 'bob', 200.0, 90, '20250101'),
+        (3, 'charlie', 300.0, 70, '20250102'),
+        (4, 'david', 400.0, 95, '20250102')
+    """)
+    print("  Created test_all_match (4 rows, will match EMR exactly)")
 
     print("Databricks setup complete!")
 
@@ -154,6 +167,23 @@ def setup_emr_tables(spark):
     """)
     print(f"  Created {full_name} (6 rows, original data)")
 
+    # 3. test_all_match — identical data
+    full_name = f"{EMR_CATALOG}.{EMR_DB}.test_all_match"
+    spark.sql(f"DROP TABLE IF EXISTS {full_name}")
+    spark.sql(f"""
+        CREATE TABLE {full_name} (
+            id INT, name STRING, amount DOUBLE, score INT, pt STRING
+        ) USING iceberg PARTITIONED BY (pt)
+    """)
+    spark.sql(f"""
+        INSERT INTO {full_name} VALUES
+        (1, 'alice', 100.0, 80, '20250101'),
+        (2, 'bob', 200.0, 90, '20250101'),
+        (3, 'charlie', 300.0, 70, '20250102'),
+        (4, 'david', 400.0, 95, '20250102')
+    """)
+    print(f"  Created {full_name} (4 rows, identical to Databricks)")
+
     print("EMR setup complete! (EMR has baseline data, Databricks has modifications)")
 
 
@@ -167,10 +197,10 @@ def main():
         from pyspark.sql import SparkSession
         spark = SparkSession.builder \
             .appName("SetupTestData") \
-            .config("spark.sql.catalog.iceberg_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-            .config("spark.sql.catalog.iceberg_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
-            .config("spark.sql.catalog.iceberg_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
-            .config("spark.sql.catalog.iceberg_catalog.warehouse", EMR_WAREHOUSE) \
+            .config("spark.sql.catalog.workspace", "org.apache.iceberg.spark.SparkCatalog") \
+            .config("spark.sql.catalog.workspace.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+            .config("spark.sql.catalog.workspace.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
+            .config("spark.sql.catalog.workspace.warehouse", EMR_WAREHOUSE) \
             .getOrCreate()
         setup_emr_tables(spark)
         spark.stop()
@@ -179,6 +209,7 @@ def main():
     print("  test_nopk_nopart: count 5(ICE) vs 6(DELTA), value max 50.9(ICE) vs 99.9(DELTA)")
     print("  test_nopk_part pt=20250101: amount max 200(ICE) vs 999(DELTA)")
     print("  test_nopk_part pt=20250102: count 3(ICE) vs 4(DELTA)")
+    print("  test_all_match: ALL PASS (identical data)")
 
 
 if __name__ == "__main__":
