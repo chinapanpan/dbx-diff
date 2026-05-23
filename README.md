@@ -1,6 +1,6 @@
-# dbx-diff: Databricks 与 EMR 数据一致性校验工具 (v3)
+# dbx-diff: Databricks 与 EMR 数据一致性校验工具 (v4)
 
-基于 PySpark 的数据对比工具，通过聚合统计值（count、max、min、avg）比较 Databricks（Delta on S3）和 EMR（Iceberg via Glue Catalog）之间的数据一致性。采用高并发方式执行，通过 `emr_common.Session` 提交至 EMR Serverless 运行。
+基于 PySpark 的数据对比工具，通过聚合统计值（count、sum、max、min）比较 Databricks（Delta on S3）和 EMR（Iceberg via Glue Catalog）之间的数据一致性。采用高并发方式执行，通过 `emr_common.Session` 提交至 EMR Serverless 运行。
 
 ## 架构
 
@@ -39,7 +39,7 @@
 | `dbx_diff.py` | 主比较引擎（PySpark 作业），基于聚合统计值对比 |
 | `submit_job.py` | 基于 emr_common.Session 的作业提交脚本 |
 | `emr_common.py` | EMR 通用类库（管理作业提交、轮询、日志获取） |
-| `setup_test_data.py` | 功能测试数据创建（2张表，覆盖分区/非分区场景） |
+| `setup_test_data.py` | 功能测试数据创建（3张表，覆盖分区/非分区/完全匹配场景） |
 | `tables.csv` | 输入 CSV 示例 |
 
 ## 快速开始
@@ -58,7 +58,9 @@ python3 submit_job.py \
   --csv tables.csv \
   --s3-output s3://your-bucket/reports/diff_report.md \
   --databricks-host https://your-workspace.cloud.databricks.com \
-  --databricks-secret-arn arn:aws:secretsmanager:us-west-2:<account>:secret:<name>
+  --databricks-secret-arn arn:aws:secretsmanager:us-west-2:<account>:secret:<name> \
+  --pt-start 20260521 \
+  --pt-end 20260522
 ```
 
 `--csv` 传入本地文件路径。`submit_job.py` 内部通过 `emr_common.Session` 完成以下流程：
@@ -78,8 +80,9 @@ python3 submit_job.py \
 | `--csv` | （必填） | 输入 CSV 本地文件路径 |
 | `--s3-output` | （必填） | S3 输出报告路径 |
 | `--databricks-host` | （必填） | Databricks workspace URL |
-| `--databricks-secret-arn` | 无 | AWS Secrets Manager ARN（OAuth2 认证，推荐） |
-| `--databricks-token` | 无 | Databricks PAT（备选，secret-arn 优先） |
+| `--databricks-secret-arn` | （必填） | AWS Secrets Manager ARN（OAuth2 或 PAT） |
+| `--pt-start` | 无 | 分区起始值（含），如 `20260521` |
+| `--pt-end` | 无 | 分区结束值（含），过滤时使用 `< end+1`，如 `20260522` |
 | `--workers` | 15 | 并行 worker 数 |
 | `--timeout` | 600 | 单表超时时间（秒） |
 | `--application-id` | （内置默认值） | EMR Serverless 应用 ID |
@@ -87,21 +90,38 @@ python3 submit_job.py \
 
 ## 输入 CSV 格式
 
-使用**空格**作为分隔符，仅两列。
+每行一个表名，第一行为表头 `table_name`。
 
-| 列名 | 是否必填 | 说明 |
-|------|----------|------|
-| `table_name` | 是 | 全路径表名：`catalog.schema.table`（两个引擎中表名一致） |
-| `pt_keys` | 否 | 需精细对比的具体分区值，逗号分隔（如 `20250101,20250102`） |
+| 列名 | 说明 |
+|------|------|
+| `table_name` | 全路径表名：`catalog.schema.table`（两个引擎中表名一致） |
 
 示例：
 ```
-table_name pt_keys
+table_name
 workspace.demo2.test_nopk_nopart
-workspace.demo2.test_nopk_part 20250101,20250102
+workspace.demo2.test_nopk_part
+workspace.demo2.test_all_match
 ```
 
-> 非分区表或不指定特定分区时，`pt_keys` 留空即可。
+> 分区过滤通过 `--pt-start` 和 `--pt-end` 全局指定，适用于所有分区表。
+
+## 分区过滤逻辑
+
+当指定 `--pt-start` 和 `--pt-end` 时，对分区表使用以下过滤条件：
+
+```sql
+WHERE pt >= '{pt_start}' AND pt < '{pt_end + 1}'
+```
+
+例如 `--pt-start 20260521 --pt-end 20260522`，实际过滤为：
+```sql
+WHERE pt >= '20260521' AND pt < '20260523'
+```
+
+过滤后仍按 `GROUP BY pt ORDER BY pt` 逐分区对比。
+
+未指定 `--pt-start`/`--pt-end` 时，自动发现两侧所有分区并对比。
 
 ## 比较规则
 
@@ -113,8 +133,8 @@ workspace.demo2.test_nopk_part 20250101,20250102
 
 | 场景 | 逻辑 |
 |------|------|
-| **非分区表** | 识别数值列（基于 Delta 表 schema），对数值列计算聚合值（count、max、min、avg），对比两侧结果 |
-| **分区表** | 识别数值列，按 `pt_keys` 过滤分区，`GROUP BY pt` 计算聚合值（count、max、min、avg），逐分区对比 |
+| **非分区表** | 识别数值列（基于 Delta 表 schema），对数值列计算聚合值（count、sum、max、min），对比两侧结果 |
+| **分区表** | 识别数值列，按分区范围过滤，`GROUP BY pt` 计算聚合值（count、sum、max、min），逐分区对比 |
 
 ### 数值列识别
 
@@ -126,27 +146,50 @@ workspace.demo2.test_nopk_part 20250101,20250102
 
 通过一条 SQL 完成所有聚合计算：
 - `count(1)` — 总行数（全表/分区级别，计算一次）
+- `sum(col)` — 每个数值列的求和
 - `max(col)` — 每个数值列的最大值
 - `min(col)` — 每个数值列的最小值
-- `avg(col)` — 每个数值列的平均值
 
 ## 输出报告
 
-Markdown 格式报告，实时追加写入，完成后同时打印到 driver 日志（stdout）并上传至 S3。
+Markdown 格式报告，完成后同时打印到 driver 日志（stdout）并上传至 S3。
+
+### 报告结构
+
+1. **报告头部** — 生成时间、表数量、分区过滤范围等元信息
+2. **差异汇总表** — 列出所有有差异的表及差异原因（快速定位问题）
+3. **各表详情** — 每张表的完整对比结果（SQL、指标明细、差异列表）
+4. **执行汇总** — 总耗时统计
+
+### 差异汇总示例
+
+```markdown
+## Difference Summary
+
+Tables with differences: **2** / 3
+
+| # | Table | Status | Difference Reason |
+|---|-------|--------|-------------------|
+| 1 | workspace.demo2.test_nopk_part | FAIL | pt=20250101: `amount`.max: Delta=999.0 vs Iceberg=200.0; ... |
+| 2 | workspace.demo2.test_nopk_nopart | FAIL | `*`.count: Delta=6 vs Iceberg=5; `value`.max: Delta=99.9 vs Iceberg=50.9; ... |
+```
 
 ### 非分区表报告示例
 
 ```markdown
 ### workspace.demo2.test_nopk_nopart — Aggregate Check: **FAIL**
 
-- Numeric columns: `['id', 'value', 'score']`
-- Delta count: 6, Iceberg count: 5
+**SQL:**
+SELECT count(1) AS total_count, sum(value) AS value_sum, max(value) AS value_max, min(value) AS value_min ...
 
-| Column | Metric | Delta Value | Iceberg Value |
-|--------|--------|-------------|---------------|
-| * | count | 6 | 5 |
-| value | max | 99.9 | 50.9 |
-| value | avg | 43.58 | 30.5 |
+**Results:**
+
+| Column | Type | Metric | Delta | Iceberg | Match |
+|--------|------|--------|-------|---------|-------|
+| * | - | count | 6 | 5 | N |
+| value | double | sum | 261.5 | 152.5 | N |
+| value | double | max | 99.9 | 50.9 | N |
+| value | double | min | 10.5 | 10.5 | Y |
 ```
 
 ### 分区表报告示例
@@ -154,48 +197,40 @@ Markdown 格式报告，实时追加写入，完成后同时打印到 driver 日
 ```markdown
 ### workspace.demo2.test_nopk_part — Partitioned Aggregate Check: **FAIL**
 
-- Numeric columns: `['id', 'amount', 'score']`
-- Partitions checked: `['20250101', '20250102']`
+**SQL:**
+SELECT pt, count(1) AS total_count, ...
+FROM workspace.demo2.test_nopk_part
+WHERE pt >= '20250101' AND pt < '20250103'
+GROUP BY pt
+ORDER BY pt
 
 #### Partition pt=20250101 — **FAIL**
 
-- Delta count: 3, Iceberg count: 3
-
-| Column | Metric | Delta Value | Iceberg Value |
-|--------|--------|-------------|---------------|
-| amount | max | 999.0 | 200.0 |
-| amount | avg | 449.67 | 150.0 |
-
-#### Partition pt=20250102 — **FAIL**
-
-- Delta count: 4, Iceberg count: 3
-
-| Column | Metric | Delta Value | Iceberg Value |
-|--------|--------|-------------|---------------|
-| * | count | 4 | 3 |
+| Column | Type | Metric | Delta | Iceberg | Match |
+|--------|------|--------|-------|---------|-------|
+| * | - | count | 3 | 3 | Y |
+| amount | double | max | 999.0 | 200.0 | N |
 ```
 
 ## 认证方式
 
-推荐使用 **OAuth2 client_credentials** 认证 Databricks API：
+通过 `--databricks-secret-arn` 传入 AWS Secrets Manager 中存储的凭证。支持两种格式：
+
+### OAuth2 client_credentials（推荐）
+
+Secret 内容格式为明文 `client_id:client_secret`：
 
 1. 在 Databricks 中创建 Service Principal 并生成 OAuth2 client_id 和 client_secret
-2. 将凭证存入 AWS Secrets Manager，格式为明文 `client_id:client_secret`
-3. 通过 `--databricks-secret-arn` 传入 Secret ARN
+2. 将凭证存入 AWS Secrets Manager，格式为 `client_id:client_secret`
+3. 程序自动识别并通过 OAuth2 流程获取 access_token
 
-程序内部调用：
-```python
-# 1. 从 Secrets Manager 获取凭证
-client_id, client_secret = get_secret_from_sm(secret_arn, region)
+### Personal Access Token (PAT)
 
-# 2. 通过 OAuth2 client_credentials 获取 access_token
-token = get_oauth2_token(databricks_host, client_id, client_secret)
+Secret 内容为 PAT 字符串（以 `dapi` 开头）：
 
-# 3. 使用 token 调用 Databricks API（token 自动刷新）
-headers = {"Authorization": f"Bearer {token}"}
-```
-
-备选方式：通过 `--databricks-token` 传入 Personal Access Token（不推荐用于生产）
+1. 在 Databricks 中生成 Personal Access Token
+2. 将 token 直接存入 AWS Secrets Manager
+3. 程序自动识别并直接使用
 
 ## EMR Serverless Application 配置
 
@@ -207,10 +242,10 @@ Spark 相关配置已在 Application 级别通过 `runtimeConfiguration` 预配�
   "properties": {
     "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
     "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-    "spark.sql.catalog.iceberg_catalog": "org.apache.iceberg.spark.SparkCatalog",
-    "spark.sql.catalog.iceberg_catalog.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
-    "spark.sql.catalog.iceberg_catalog.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
-    "spark.sql.catalog.iceberg_catalog.warehouse": "s3://your-bucket/emr/warehouse",
+    "spark.sql.catalog.workspace": "org.apache.iceberg.spark.SparkCatalog",
+    "spark.sql.catalog.workspace.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
+    "spark.sql.catalog.workspace.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+    "spark.sql.catalog.workspace.warehouse": "s3://your-bucket/emr/warehouse",
     "spark.executor.memory": "4g",
     "spark.executor.cores": "4",
     "spark.dynamicAllocation.enabled": "true",
@@ -226,6 +261,8 @@ Spark 相关配置已在 Application 级别通过 `runtimeConfiguration` 预配�
   }
 }
 ```
+
+> **注意**：Iceberg catalog 名称必须与 Databricks 端的 catalog 名称一致（如 `workspace`），这样两边使用完全相同的 `catalog.schema.table` 路径。
 
 ### 环境要求
 
@@ -244,11 +281,18 @@ python3.12 -m venv /tmp/pyspark_venv
 # 安装依赖
 /tmp/pyspark_venv/bin/pip install requests certifi boto3
 
+# 替换 symlink 为实际二进制
+rm -f /tmp/pyspark_venv/bin/python3.12
+cp /usr/bin/python3.12 /tmp/pyspark_venv/bin/python3.12
+ln -sf python3.12 /tmp/pyspark_venv/bin/python3
+ln -sf python3.12 /tmp/pyspark_venv/bin/python
+
 # 拷贝系统库（确保 OpenSSL、zlib 等可用）
 cp /lib64/libcrypto.so.3 /tmp/pyspark_venv/lib/
 cp /lib64/libssl.so.3 /tmp/pyspark_venv/lib/
 cp /lib64/libz.so.1 /tmp/pyspark_venv/lib/
 cp /usr/lib64/libpython3.12.so.1.0 /tmp/pyspark_venv/lib/
+ldd /usr/bin/python3.12 | grep "=>" | awk '{print $3}' | xargs -I{} cp {} /tmp/pyspark_venv/lib/
 
 # 拷贝 Python 标准库和 C 扩展模块
 cp -r /usr/lib64/python3.12/* /tmp/pyspark_venv/lib/python3.12/
@@ -270,7 +314,7 @@ aws s3 cp /tmp/pyspark_py312_venv.tar.gz s3://your-bucket/code/pyspark_py312_ven
 from emr_common import Session
 
 session = Session(
-    application_id="00g5qqg0spv6bq0l",
+    application_id="00g5t48pdtcnid0l",
     jobtype=1,
     region="us-west-2",
     job_role="arn:aws:iam::<account>:role/EMRServerlessExecutionRole",
@@ -282,7 +326,8 @@ session = Session(
 result = session.submit_file(
     jobname="dbx_diff",
     local_file="/path/to/dbx_diff.py",
-    args=["--csv", "s3://bucket/tables.csv", "--s3-output", "s3://bucket/report.md"],
+    args=["--csv", "s3://bucket/tables.csv", "--s3-output", "s3://bucket/report.md",
+          "--pt-start", "20260521", "--pt-end", "20260522"],
 )
 
 print(f"状态: {result.status}")  # SUCCESS / FAILED
