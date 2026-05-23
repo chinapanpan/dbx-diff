@@ -518,14 +518,16 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str,
             result_md += f"| Delta | {dbx_count} |\n"
             result_md += f"| Iceberg | {emr_count} |\n"
             match = dbx_count == emr_count
+            diffs = []
             if not match:
                 result_md += f"\n> **FAIL** — Difference: {dbx_count - emr_count:+d}\n"
+                diffs.append({"column": "*", "metric": "count", "delta_value": dbx_count, "iceberg_value": emr_count})
             else:
                 result_md += f"\n> **PASS**\n"
             append_md(report_path, result_md)
             elapsed = time.time() - start_time
             append_md(report_path, f"\n> Completed in {elapsed:.1f}s\n")
-            return {"table": table_name, "match": match, "partitioned": False, "diffs": []}
+            return {"table": table_name, "match": match, "partitioned": False, "diffs": diffs}
         elif not is_partitioned:
             col_types = get_column_types(df_dbx, numeric_cols)
             result = compare_aggregates_non_partitioned(df_dbx, df_emr, numeric_cols, col_types, table_name)
