@@ -1,7 +1,7 @@
 """
 基于 emr_common.Session 提交 dbx_diff.py 作业到 EMR Serverless (v5 - Scheduler Edition).
 
-所有参数通过 --widgets JSON 传递给 dbx_diff.py。
+所有参数通过 --widget JSON 传递给 dbx_diff.py。
 
 Usage:
   python3 submit_job.py \
@@ -39,9 +39,9 @@ def build_spark_conf(args) -> str:
     return " ".join(confs)
 
 
-def build_widgets_json(args) -> str:
-    """构建 --widgets 所需的 JSON 字符串。"""
-    widgets = {
+def build_widget_json(args) -> str:
+    """构建 --widget 所需的 JSON 字符串。"""
+    widget = {
         "table_name": args.table_name,
         "iceberg-output": args.iceberg_output,
         "databricks-host": args.databricks_host,
@@ -55,7 +55,7 @@ def build_widgets_json(args) -> str:
         "instance_id": args.instance_id,
         "attemp_id": args.attemp_id,
     }
-    return json.dumps(widgets)
+    return json.dumps(widget)
 
 
 def main():
@@ -90,7 +90,7 @@ def main():
                         help="EMR Serverless 执行角色 ARN")
     args = parser.parse_args()
 
-    widgets_json = build_widgets_json(args)
+    widget_json = build_widget_json(args)
 
     session = Session(
         application_id=args.application_id,
@@ -103,7 +103,7 @@ def main():
     )
 
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dbx_diff.py")
-    job_args = ["--widgets", widgets_json]
+    job_args = ["--widget", widget_json]
 
     print(f"应用 ID: {args.application_id}")
     print(f"表名: {args.table_name}")
@@ -113,7 +113,7 @@ def main():
     print(f"Task ID: {args.task_id}")
     print(f"Instance ID: {args.instance_id}")
     print(f"Attemp ID: {args.attemp_id}")
-    print(f"Widgets JSON: {widgets_json}")
+    print(f"Widget JSON: {widget_json}")
 
     result = session.submit_file("dbx_diff", script_path, args=job_args)
 

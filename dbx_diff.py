@@ -5,7 +5,7 @@ Compares numeric column aggregates (count, sum, max, min) between
 Databricks (Delta on S3) and EMR (Iceberg via Glue catalog).
 Results are written to an Iceberg table instead of S3.
 
-All parameters are passed via --widgets as a JSON string.
+All parameters are passed via --widget as a JSON string.
 """
 
 import sys
@@ -616,10 +616,10 @@ def compare_single_table(spark: SparkSession, table_name: str,
 
 def main():
     parser = argparse.ArgumentParser(description="Databricks vs EMR Data Diff Tool (v5 - Scheduler)")
-    parser.add_argument("--widgets", required=True, help="JSON string with all parameters")
+    parser.add_argument("--widget", required=True, help="JSON string with all parameters")
     args = parser.parse_args()
 
-    params = json.loads(args.widgets)
+    params = json.loads(args.widget)
 
     table_name = params.get("table_name")
     iceberg_output = params.get("iceberg-output")
@@ -647,7 +647,7 @@ def main():
     }
     missing = [k for k, v in required_params.items() if not v]
     if missing:
-        print(f"ERROR: Missing required params in --widgets JSON: {', '.join(missing)}", file=sys.stderr)
+        print(f"ERROR: Missing required params in --widget JSON: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
     global DATABRICKS_HOST, DATABRICKS_TOKEN
