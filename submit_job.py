@@ -72,11 +72,11 @@ def main():
                         help="分区起始值（含），如 20260521")
     parser.add_argument("--pt-end", required=True,
                         help="分区结束值（含），如 20260522")
-    parser.add_argument("--task-id", default="",
+    parser.add_argument("--task-id", required=True,
                         help="任务 ID（写入 Iceberg 结果表）")
-    parser.add_argument("--instance-id", default="",
+    parser.add_argument("--instance-id", required=True,
                         help="实例 ID（写入 Iceberg 结果表）")
-    parser.add_argument("--attemp-id", default="",
+    parser.add_argument("--attemp-id", required=True,
                         help="尝试 ID（写入 Iceberg 结果表）")
     parser.add_argument("--workers", type=int, default=15,
                         help="并行 worker 数（默认 15）")

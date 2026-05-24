@@ -623,9 +623,9 @@ def main():
 
     table_name = params.get("table_name")
     iceberg_output = params.get("iceberg-output")
-    task_id = params.get("task_id", "")
-    instance_id = params.get("instance_id", "")
-    attemp_id = params.get("attemp_id", "")
+    task_id = params.get("task_id")
+    instance_id = params.get("instance_id")
+    attemp_id = params.get("attemp_id")
     databricks_host = params.get("databricks-host")
     databricks_secret_arn = params.get("databricks-secret-arn")
     region = params.get("region", "us-west-2")
@@ -634,20 +634,20 @@ def main():
     workers = int(params.get("workers", MAX_WORKERS))
     timeout = int(params.get("timeout", TIMEOUT_PER_TABLE))
 
-    if not table_name:
-        print("ERROR: 'table_name' is required in --widgets JSON", file=sys.stderr)
-        sys.exit(1)
-    if not iceberg_output:
-        print("ERROR: 'iceberg-output' is required in --widgets JSON", file=sys.stderr)
-        sys.exit(1)
-    if not databricks_host:
-        print("ERROR: 'databricks-host' is required in --widgets JSON", file=sys.stderr)
-        sys.exit(1)
-    if not databricks_secret_arn:
-        print("ERROR: 'databricks-secret-arn' is required in --widgets JSON", file=sys.stderr)
-        sys.exit(1)
-    if not pt_start or not pt_end:
-        print("ERROR: 'pt-start' and 'pt-end' are required in --widgets JSON", file=sys.stderr)
+    required_params = {
+        "table_name": table_name,
+        "iceberg-output": iceberg_output,
+        "databricks-host": databricks_host,
+        "databricks-secret-arn": databricks_secret_arn,
+        "pt-start": pt_start,
+        "pt-end": pt_end,
+        "task_id": task_id,
+        "instance_id": instance_id,
+        "attemp_id": attemp_id,
+    }
+    missing = [k for k, v in required_params.items() if not v]
+    if missing:
+        print(f"ERROR: Missing required params in --widgets JSON: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
     global DATABRICKS_HOST, DATABRICKS_TOKEN
