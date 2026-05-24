@@ -621,11 +621,11 @@ def main():
 
     params = json.loads(args.widget)
 
-    table_name = params.get("table_name")
+    table_name = params.get("table-name")
     iceberg_output = params.get("iceberg-output")
-    task_id = params.get("task_id")
-    instance_id = params.get("instance_id")
-    attemp_id = params.get("attemp_id")
+    task_id = params.get("task-id")
+    instance_id = params.get("instance-id")
+    attemp_id = params.get("attemp-id")
     databricks_host = params.get("databricks-host")
     databricks_secret_arn = params.get("databricks-secret-arn")
     region = params.get("region", "us-west-2")
@@ -635,15 +635,15 @@ def main():
     timeout = int(params.get("timeout", TIMEOUT_PER_TABLE))
 
     required_params = {
-        "table_name": table_name,
+        "table-name": table_name,
         "iceberg-output": iceberg_output,
         "databricks-host": databricks_host,
         "databricks-secret-arn": databricks_secret_arn,
         "pt-start": pt_start,
         "pt-end": pt_end,
-        "task_id": task_id,
-        "instance_id": instance_id,
-        "attemp_id": attemp_id,
+        "task-id": task_id,
+        "instance-id": instance_id,
+        "attemp-id": attemp_id,
     }
     missing = [k for k, v in required_params.items() if not v]
     if missing:

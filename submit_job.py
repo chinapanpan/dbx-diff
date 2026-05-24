@@ -42,7 +42,7 @@ def build_spark_conf(args) -> str:
 def build_widget_json(args) -> str:
     """构建 --widget 所需的 JSON 字符串。"""
     widget = {
-        "table_name": args.table_name,
+        "table-name": args.table_name,
         "iceberg-output": args.iceberg_output,
         "databricks-host": args.databricks_host,
         "databricks-secret-arn": args.databricks_secret_arn,
@@ -51,9 +51,9 @@ def build_widget_json(args) -> str:
         "workers": str(args.workers),
         "timeout": str(args.timeout),
         "region": args.region,
-        "task_id": args.task_id,
-        "instance_id": args.instance_id,
-        "attemp_id": args.attemp_id,
+        "task-id": args.task_id,
+        "instance-id": args.instance_id,
+        "attemp-id": args.attemp_id,
     }
     return json.dumps(widget)
 
