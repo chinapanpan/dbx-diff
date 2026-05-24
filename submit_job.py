@@ -1,25 +1,25 @@
 """
-基于 emr_common.Session 提交 dbx_diff.py 作业到 EMR Serverless。
+基于 emr_common.Session 提交 dbx_diff.py 作业到 EMR Serverless (v5 - Scheduler Edition).
 
-Spark 相关配置（Iceberg catalog、venv、动态分配等）已在 EMR Serverless Application 级别配置，
-本脚本仅需传入业务参数。
+所有参数通过 --widgets JSON 传递给 dbx_diff.py。
 
 Usage:
   python3 submit_job.py \
-    --csv tables.csv \
-    --s3-output s3://zpf-databricks-event/reports/diff_report.md \
+    --table-name workspace.demo2.test_nopk_part \
+    --iceberg-output workspace.demo2.verify_result \
     --databricks-host https://dbc-51ad87e6-c26d.cloud.databricks.com \
-    --databricks-secret-arn arn:aws:secretsmanager:us-west-2:<account>:secret:<name> \
+    --databricks-secret-arn arn:aws:secretsmanager:us-west-2:785682719467:secret:databricks-6lajvp \
     --pt-start 20260521 \
-    --pt-end 20260522
+    --pt-end 20260522 \
+    --task-id task001 \
+    --instance-id inst001 \
+    --attemp-id att001
 """
 
 import argparse
 import sys
 import os
-from datetime import datetime
-
-import boto3
+import json
 
 from emr_common import Session
 
@@ -31,30 +31,6 @@ S3_SCRIPTS_PATH = "s3://zpf-databricks-event/code/"
 REGION = "us-west-2"
 
 
-def upload_csv_to_s3(local_csv: str) -> str:
-    """上传本地 CSV 到 S3，返回 S3 路径。"""
-    filename = os.path.basename(local_csv)
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    s3_bucket = S3_SCRIPTS_PATH.split("/")[2]
-    s3_key_prefix = "/".join(S3_SCRIPTS_PATH.split("/")[3:])
-    s3_key = f"{s3_key_prefix}{timestamp}_{filename}"
-
-    s3 = boto3.client("s3")
-    s3.upload_file(local_csv, s3_bucket, s3_key)
-    s3_path = f"s3://{s3_bucket}/{s3_key}"
-    print(f"已上传 CSV: {local_csv} -> {s3_path}")
-    return s3_path
-
-
-def delete_s3_file(s3_path: str):
-    """删除 S3 上的文件。"""
-    s3 = boto3.client("s3")
-    bucket = s3_path.split("/")[2]
-    key = "/".join(s3_path.split("/")[3:])
-    s3.delete_object(Bucket=bucket, Key=key)
-    print(f"已清除 S3 临时文件: {s3_path}")
-
-
 def build_spark_conf(args) -> str:
     """构建运行时需要的环境变量配置（仅 Databricks 凭证相关）。"""
     confs = [
@@ -63,41 +39,58 @@ def build_spark_conf(args) -> str:
     return " ".join(confs)
 
 
-def build_job_args(args, s3_csv: str) -> list:
-    """构建 dbx_diff.py 的入口参数。"""
-    job_args = [
-        "--csv", s3_csv,
-        "--s3-output", args.s3_output,
-        "--workers", str(args.workers),
-        "--timeout", str(args.timeout),
-        "--databricks-host", args.databricks_host,
-        "--databricks-secret-arn", args.databricks_secret_arn,
-    ]
-    if args.pt_start:
-        job_args.extend(["--pt-start", args.pt_start])
-    if args.pt_end:
-        job_args.extend(["--pt-end", args.pt_end])
-    return job_args
+def build_widgets_json(args) -> str:
+    """构建 --widgets 所需的 JSON 字符串。"""
+    widgets = {
+        "table_name": args.table_name,
+        "iceberg-output": args.iceberg_output,
+        "databricks-host": args.databricks_host,
+        "databricks-secret-arn": args.databricks_secret_arn,
+        "pt-start": args.pt_start,
+        "pt-end": args.pt_end,
+        "workers": str(args.workers),
+        "timeout": str(args.timeout),
+        "region": args.region,
+        "task_id": args.task_id,
+        "instance_id": args.instance_id,
+        "attemp_id": args.attemp_id,
+    }
+    return json.dumps(widgets)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="提交 dbx_diff 数据对比作业")
-    parser.add_argument("--csv", required=True, help="输入 CSV 路径（本地文件）")
-    parser.add_argument("--s3-output", required=True, help="S3 报告输出路径")
-    parser.add_argument("--databricks-host", required=True, help="Databricks workspace URL")
+    parser = argparse.ArgumentParser(description="提交 dbx_diff 数据对比作业 (v5 - Scheduler)")
+    parser.add_argument("--table-name", required=True,
+                        help="待比较表名，全路径：catalog.db.tablename")
+    parser.add_argument("--iceberg-output", required=True,
+                        help="结果写入的 Iceberg 表名（全路径）")
+    parser.add_argument("--databricks-host", required=True,
+                        help="Databricks workspace URL")
     parser.add_argument("--databricks-secret-arn", required=True,
                         help="AWS Secrets Manager ARN（OAuth2 认证）")
-    parser.add_argument("--pt-start", default=None, help="分区起始值（含），如 20260521")
-    parser.add_argument("--pt-end", default=None, help="分区结束值（含，过滤时用 < end+1），如 20260522")
-    parser.add_argument("--workers", type=int, default=15, help="并行 worker 数（默认 15）")
-    parser.add_argument("--timeout", type=int, default=600, help="单表超时秒数（默认 600）")
+    parser.add_argument("--pt-start", required=True,
+                        help="分区起始值（含），如 20260521")
+    parser.add_argument("--pt-end", required=True,
+                        help="分区结束值（含），如 20260522")
+    parser.add_argument("--task-id", default="",
+                        help="任务 ID（写入 Iceberg 结果表）")
+    parser.add_argument("--instance-id", default="",
+                        help="实例 ID（写入 Iceberg 结果表）")
+    parser.add_argument("--attemp-id", default="",
+                        help="尝试 ID（写入 Iceberg 结果表）")
+    parser.add_argument("--workers", type=int, default=15,
+                        help="并行 worker 数（默认 15）")
+    parser.add_argument("--timeout", type=int, default=1800,
+                        help="单表超时秒数（默认 1800）")
+    parser.add_argument("--region", default="us-west-2",
+                        help="AWS Secrets Manager 区域（默认 us-west-2）")
     parser.add_argument("--application-id", default=EMR_SERVERLESS_APP_ID,
                         help="EMR Serverless 应用 ID")
     parser.add_argument("--execution-role-arn", default=EXECUTION_ROLE_ARN,
                         help="EMR Serverless 执行角色 ARN")
     args = parser.parse_args()
 
-    s3_csv = upload_csv_to_s3(args.csv)
+    widgets_json = build_widgets_json(args)
 
     session = Session(
         application_id=args.application_id,
@@ -110,21 +103,22 @@ def main():
     )
 
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dbx_diff.py")
-    job_args = build_job_args(args, s3_csv)
+    job_args = ["--widgets", widgets_json]
 
     print(f"应用 ID: {args.application_id}")
-    print(f"输入 CSV: {args.csv} -> {s3_csv}")
-    print(f"输出报告: {args.s3_output}")
+    print(f"表名: {args.table_name}")
+    print(f"Iceberg 输出表: {args.iceberg_output}")
     print(f"认证方式: OAuth2 (secret-arn)")
-    if args.pt_start and args.pt_end:
-        print(f"分区范围: pt >= {args.pt_start} AND pt < {int(args.pt_end) + 1}")
+    print(f"分区范围: pt >= {args.pt_start} AND pt < {int(args.pt_end) + 1}")
+    print(f"Task ID: {args.task_id}")
+    print(f"Instance ID: {args.instance_id}")
+    print(f"Attemp ID: {args.attemp_id}")
+    print(f"Widgets JSON: {widgets_json}")
 
     result = session.submit_file("dbx_diff", script_path, args=job_args)
 
-    delete_s3_file(s3_csv)
-
     if result.status in ("SUCCESS", "COMPLETED"):
-        print(f"\n作业成功完成。报告路径: {args.s3_output}")
+        print(f"\n作业成功完成。结果已写入: {args.iceberg_output}")
         sys.exit(0)
     else:
         print(f"\n作业失败，状态: {result.status}", file=sys.stderr)
