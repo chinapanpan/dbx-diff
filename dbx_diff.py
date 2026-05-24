@@ -467,10 +467,15 @@ def format_summary_section(results: List[Dict]) -> str:
             reason = "; ".join(reasons) if reasons else "Unknown"
         else:
             reasons = []
-            for pr in r.get("partition_results", []):
-                if not pr.get("match", True):
-                    for diff in pr.get("diffs", []):
-                        reasons.append(f"pt={pr['pt']}: `{diff['column']}`.{diff['metric']}: Delta={diff['delta_value']} vs Iceberg={diff['iceberg_value']}")
+            if r.get("partition_results"):
+                for pr in r["partition_results"]:
+                    if not pr.get("match", True):
+                        for diff in pr.get("diffs", []):
+                            reasons.append(f"pt={pr['pt']}: `{diff['column']}`.{diff['metric']}: Delta={diff['delta_value']} vs Iceberg={diff['iceberg_value']}")
+            else:
+                for diff in r.get("diffs", []):
+                    pt_info = f"pt={diff['pt']}: " if diff.get("pt") else ""
+                    reasons.append(f"{pt_info}`{diff['column']}`.{diff['metric']}: Delta={diff['delta_value']} vs Iceberg={diff['iceberg_value']}")
             reason = "; ".join(reasons) if reasons else "Unknown"
         md += f"| {i} | {table_name} | FAIL | {reason} |\n"
 
@@ -527,24 +532,49 @@ def compare_single_table(spark: SparkSession, config: Dict, report_path: str,
                 sql = f"SELECT count(1) AS total_count\nFROM {table_name}"
                 df_dbx_filtered = df_dbx
                 df_emr_filtered = df_emr
-            dbx_count = df_dbx_filtered.count()
-            emr_count = df_emr_filtered.count()
+
             result_md = f"\n### {table_name} — Count Only (no numeric columns)\n\n"
             result_md += f"**SQL:**\n```sql\n{sql}\n```\n\n"
-            result_md += f"| Side | Count |\n|------|-------|\n"
-            result_md += f"| Delta | {dbx_count} |\n"
-            result_md += f"| Iceberg | {emr_count} |\n"
-            match = dbx_count == emr_count
-            diffs = []
+
+            if is_partitioned:
+                dbx_pt_counts = {row["pt"]: row["cnt"] for row in
+                                 df_dbx_filtered.groupBy("pt").agg(F.count(F.lit(1)).alias("cnt")).collect()}
+                emr_pt_counts = {row["pt"]: row["cnt"] for row in
+                                 df_emr_filtered.groupBy("pt").agg(F.count(F.lit(1)).alias("cnt")).collect()}
+                all_pts = sorted(set(list(dbx_pt_counts.keys()) + list(emr_pt_counts.keys())))
+                all_match = True
+                diffs = []
+                result_md += "| pt | Delta Count | Iceberg Count | Match |\n"
+                result_md += "|----|-------------|---------------|-------|\n"
+                for pt_val in all_pts:
+                    d_cnt = dbx_pt_counts.get(pt_val, 0)
+                    e_cnt = emr_pt_counts.get(pt_val, 0)
+                    pt_match = d_cnt == e_cnt
+                    result_md += f"| {pt_val} | {d_cnt} | {e_cnt} | {'Y' if pt_match else 'N'} |\n"
+                    if not pt_match:
+                        all_match = False
+                        diffs.append({"column": "*", "metric": "count", "pt": pt_val,
+                                      "delta_value": d_cnt, "iceberg_value": e_cnt})
+                match = all_match
+            else:
+                dbx_count = df_dbx_filtered.count()
+                emr_count = df_emr_filtered.count()
+                result_md += f"| Side | Count |\n|------|-------|\n"
+                result_md += f"| Delta | {dbx_count} |\n"
+                result_md += f"| Iceberg | {emr_count} |\n"
+                match = dbx_count == emr_count
+                diffs = []
+                if not match:
+                    diffs.append({"column": "*", "metric": "count", "delta_value": dbx_count, "iceberg_value": emr_count})
+
             if not match:
-                result_md += f"\n> **FAIL** — Difference: {dbx_count - emr_count:+d}\n"
-                diffs.append({"column": "*", "metric": "count", "delta_value": dbx_count, "iceberg_value": emr_count})
+                result_md += f"\n> **FAIL**\n"
             else:
                 result_md += f"\n> **PASS**\n"
             append_md(report_path, result_md)
             elapsed = time.time() - start_time
             append_md(report_path, f"\n> Completed in {elapsed:.1f}s\n")
-            return {"table": table_name, "match": match, "partitioned": False, "diffs": diffs}
+            return {"table": table_name, "match": match, "partitioned": is_partitioned, "diffs": diffs}
         elif not is_partitioned:
             col_types = get_column_types(df_dbx, numeric_cols)
             result = compare_aggregates_non_partitioned(df_dbx, df_emr, numeric_cols, col_types, table_name)
